@@ -2,8 +2,8 @@
 /**
  * Plugin Name: CHIROBASIX Site Fixes
  * Plugin URI:  https://chirobasix.com
- * Description: Agency-wide compatibility fixes for CHIROBASIX client sites. Currently: keeps HighLevel booking calendars/forms and similar embeds out of WP Rocket LazyLoad (both the filter AND the saved option, since the filter alone does not exclude iframes) so they render at full height instead of being cut off. Auto-updates from GitHub.
- * Version:     1.1.0
+ * Description: Agency-wide compatibility fixes for CHIROBASIX client sites. (1) Keeps HighLevel booking calendars/forms and similar embeds out of WP Rocket LazyLoad (filter + saved option) so they render at full height. (2) Collapses RankMath's dual-typed Organization/LocalBusiness schema node to its LocalBusiness subtype so priceRange/openingHours validate (fixes SEMRush "property not recognized by Organization"). Auto-updates from GitHub.
+ * Version:     1.2.0
  * Author:      CHIROBASIX
  * Author URI:  https://chirobasix.com
  * License:     GPL-2.0+
@@ -14,7 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'CBXSF_VERSION', '1.1.0' );
+define( 'CBXSF_VERSION', '1.2.0' );
 
 /**
  * The embed hosts that must never be lazy-loaded or delayed (they self-resize via postMessage
@@ -103,6 +103,51 @@ function cbxsf_sync_rocket_options() {
 }
 add_action( 'admin_init', 'cbxsf_sync_rocket_options' );
 add_action( 'init', 'cbxsf_sync_rocket_options', 99 ); // also cover front-end/WP-CLI so it applies without an admin visit
+
+/**
+ * FIX #3 — RankMath dual-typed Organization/LocalBusiness node fails validation.
+ *
+ * When RankMath's Local SEO is enabled, it types the site's business node as BOTH a LocalBusiness
+ * subtype (e.g. Chiropractor) AND Organization, and adds LocalBusiness-only properties like
+ * `priceRange` and `openingHours`. Those properties are valid for the LocalBusiness subtype but
+ * NOT for Organization, so strict validators (SEMRush) flag them as "not recognized by the
+ * Organization vocabulary" on every page. Collapsing the node to its LocalBusiness subtype alone
+ * fixes it — the subtype is still an Organization by inheritance (logo/sameAs/publisher references
+ * are unaffected), but the properties are now valid. Only runs when RankMath is active; a node must
+ * be BOTH Organization AND a LocalBusiness subtype to be touched (pure Organizations are left alone).
+ *
+ * Per-site override: add_filter( 'cbxsf_collapse_dual_type', '__return_false' );
+ */
+add_filter(
+	'rank_math/json_ld',
+	function ( $data, $jsonld ) {
+		if ( ! is_array( $data ) || ! apply_filters( 'cbxsf_collapse_dual_type', true ) ) {
+			return $data;
+		}
+		foreach ( $data as $key => $node ) {
+			if ( ! is_array( $node ) || ! isset( $node['@type'] ) || ! is_array( $node['@type'] ) ) {
+				continue;
+			}
+			$type = $node['@type'];
+			if ( ! in_array( 'Organization', $type, true ) ) {
+				continue;
+			}
+			$sub = null;
+			foreach ( array( 'Chiropractor', 'Physician', 'Dentist', 'MedicalBusiness', 'LocalBusiness' ) as $candidate ) {
+				if ( in_array( $candidate, $type, true ) ) {
+					$sub = $candidate;
+					break;
+				}
+			}
+			if ( $sub ) {
+				$data[ $key ]['@type'] = $sub;
+			}
+		}
+		return $data;
+	},
+	99,
+	2
+);
 
 /**
  * GitHub auto-updater (mirrors the other CHIROBASIX plugins).
