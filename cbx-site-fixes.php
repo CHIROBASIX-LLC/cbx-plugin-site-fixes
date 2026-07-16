@@ -2,8 +2,8 @@
 /**
  * Plugin Name: CHIROBASIX Site Fixes
  * Plugin URI:  https://chirobasix.com
- * Description: Agency-wide compatibility fixes for CHIROBASIX client sites. (1) Keeps HighLevel booking calendars/forms and similar embeds out of WP Rocket LazyLoad (filter + saved option) so they render at full height. (2) Collapses RankMath's dual-typed Organization/LocalBusiness schema node to its LocalBusiness subtype so priceRange/openingHours validate (fixes SEMRush "property not recognized by Organization") + strips RankMath's malformed address-less potentialAction org-stub on symptom/service pages (fixes SEMRush "LocalBusiness address required"). Auto-updates from GitHub.
- * Version:     1.3.0
+ * Description: Agency-wide compatibility fixes for CHIROBASIX client sites. (1) Keeps HighLevel booking calendars/forms and similar embeds out of WP Rocket LazyLoad (filter + saved option) so they render at full height. (2) Collapses RankMath's dual-typed Organization/LocalBusiness schema node to its LocalBusiness subtype so priceRange/openingHours validate (fixes SEMRush "property not recognized by Organization") + strips RankMath's malformed address-less potentialAction org-stub on symptom/service pages (fixes SEMRush "LocalBusiness address required") + derives thumbnailUrl for YouTube VideoObjects missing it (fixes SEMRush "thumbnailUrl required"). Auto-updates from GitHub.
+ * Version:     1.4.0
  * Author:      CHIROBASIX
  * Author URI:  https://chirobasix.com
  * License:     GPL-2.0+
@@ -14,7 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'CBXSF_VERSION', '1.3.0' );
+define( 'CBXSF_VERSION', '1.4.0' );
 
 /**
  * The embed hosts that must never be lazy-loaded or delayed (they self-resize via postMessage
@@ -176,6 +176,52 @@ add_filter(
 		return $data;
 	},
 	99999, // run LAST — the basix-core-child theme injects its (malformed) potentialAction at prio 170
+	2
+);
+
+/**
+ * FIX #4 — VideoObject missing thumbnailUrl.
+ *
+ * RankMath auto-detects a YouTube embed on symptom/service pages and emits a VideoObject with an
+ * `embedUrl` but no `thumbnailUrl`, which Google/SEMRush flag as invalid ("thumbnailUrl required").
+ * YouTube thumbnails are deterministic from the video id, so we derive one from the embed/content
+ * URL whenever it is missing. Recursive so it catches the node wherever RankMath places it.
+ */
+add_filter(
+	'rank_math/json_ld',
+	function ( $data, $jsonld ) {
+		if ( ! is_array( $data ) ) {
+			return $data;
+		}
+		$fix = function ( &$node ) use ( &$fix ) {
+			if ( ! is_array( $node ) ) {
+				return;
+			}
+			$type = isset( $node['@type'] ) ? (array) $node['@type'] : array();
+			if ( in_array( 'VideoObject', $type, true ) && empty( $node['thumbnailUrl'] ) ) {
+				$src = '';
+				foreach ( array( 'embedUrl', 'contentUrl', 'url' ) as $k ) {
+					if ( ! empty( $node[ $k ] ) && is_string( $node[ $k ] ) ) {
+						$src = $node[ $k ];
+						break;
+					}
+				}
+				if ( $src && preg_match( '#(?:youtu\.be/|youtube\.com/(?:watch\?v=|embed/|shorts/|v/))([A-Za-z0-9_-]{11})#', $src, $m ) ) {
+					$node['thumbnailUrl'] = 'https://i.ytimg.com/vi/' . $m[1] . '/hqdefault.jpg';
+				}
+			}
+			foreach ( $node as &$child ) {
+				if ( is_array( $child ) ) {
+					$fix( $child );
+				}
+			}
+		};
+		foreach ( $data as &$node ) {
+			$fix( $node );
+		}
+		return $data;
+	},
+	99999,
 	2
 );
 
