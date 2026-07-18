@@ -29,7 +29,18 @@ class CBXSF_Updater {
 		add_filter( 'upgrader_post_install', array( $this, 'post_install' ), 10, 3 );
 	}
 
-	private function get_github_release() {
+	/**
+	 * Fetch the latest GitHub release, heavily guarded so an update check can
+	 * never noticeably stall a latency-sensitive request (Elementor editor
+	 * loads/saves, admin-ajax, heartbeats):
+	 *  - successes are cached in a transient (as before);
+	 *  - FAILURES set a 15-min backoff transient, so a rate-limited GitHub
+	 *    (60 unauth req/hr/IP — shared WPE egress IPs burn this fast) is not
+	 *    re-paid on every transient refresh;
+	 *  - the HTTP timeout is 3s (was 10s);
+	 *  - when $allow_network is false, only cached data is returned.
+	 */
+	private function get_github_release( $allow_network = true ) {
 		if ( null !== $this->github_response ) {
 			return $this->github_response;
 		}
@@ -40,6 +51,13 @@ class CBXSF_Updater {
 		if ( false !== $cached ) {
 			$this->github_response = $cached;
 			return $cached;
+		}
+
+		if ( ! $allow_network || false !== get_transient( 'cbxsf_github_backoff' ) ) {
+			// No cached release and either network is disallowed for this
+			// request or we recently failed — skip silently; cron/next
+			// eligible request will retry.
+			return false;
 		}
 
 		$url = sprintf(
@@ -55,11 +73,12 @@ class CBXSF_Updater {
 					'Accept'     => 'application/vnd.github.v3+json',
 					'User-Agent' => 'CBX-Site-Fixes-Updater',
 				),
-				'timeout' => 10,
+				'timeout' => 3,
 			)
 		);
 
 		if ( is_wp_error( $response ) || 200 !== wp_remote_retrieve_response_code( $response ) ) {
+			set_transient( 'cbxsf_github_backoff', 1, 15 * MINUTE_IN_SECONDS );
 			$this->github_response = false;
 			return false;
 		}
@@ -67,6 +86,7 @@ class CBXSF_Updater {
 		$body = json_decode( wp_remote_retrieve_body( $response ), true );
 
 		if ( empty( $body['tag_name'] ) ) {
+			set_transient( 'cbxsf_github_backoff', 1, 15 * MINUTE_IN_SECONDS );
 			$this->github_response = false;
 			return false;
 		}
@@ -88,7 +108,16 @@ class CBXSF_Updater {
 			return $transient;
 		}
 
-		$release = $this->get_github_release();
+		// Never perform network I/O during latency-sensitive requests: any
+		// admin-ajax call (Elementor autosaves, heartbeats) or the Elementor
+		// editor page itself (post.php?action=elementor). WP core's
+		// _maybe_update_plugins() piggybacks on admin_init for these requests,
+		// which is how a slow GitHub response used to stall the editor.
+		// Cached data is still used; cron + normal admin screens do the fetch.
+		$latency_sensitive = wp_doing_ajax()
+			|| ( isset( $_GET['action'] ) && 'elementor' === $_GET['action'] ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+
+		$release = $this->get_github_release( ! $latency_sensitive );
 		if ( ! $release ) {
 			return $transient;
 		}
