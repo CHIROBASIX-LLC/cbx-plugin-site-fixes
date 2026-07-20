@@ -3,7 +3,7 @@
  * Plugin Name: CHIROBASIX Site Fixes
  * Plugin URI:  https://chirobasix.com
  * Description: Agency-wide compatibility fixes for CHIROBASIX client sites. (1) Keeps HighLevel booking calendars/forms and similar embeds out of WP Rocket LazyLoad (filter + saved option) so they render at full height. (2) Collapses RankMath's dual-typed Organization/LocalBusiness schema node to its LocalBusiness subtype so priceRange/openingHours validate (fixes SEMRush "property not recognized by Organization") + strips RankMath's malformed address-less potentialAction org-stub on symptom/service pages (fixes SEMRush "LocalBusiness address required") + derives thumbnailUrl for YouTube VideoObjects missing it (fixes SEMRush "thumbnailUrl required"). Auto-updates from GitHub.
- * Version:     1.4.1
+ * Version:     1.5.0
  * Author:      CHIROBASIX
  * Author URI:  https://chirobasix.com
  * License:     GPL-2.0+
@@ -14,7 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'CBXSF_VERSION', '1.4.1' );
+define( 'CBXSF_VERSION', '1.5.0' );
 
 /**
  * The embed hosts that must never be lazy-loaded or delayed (they self-resize via postMessage
@@ -223,6 +223,51 @@ add_filter(
 	},
 	99999,
 	2
+);
+
+/**
+ * FIX #5 — UAE (Ultimate Addons for Elementor) Business Reviews stalls admin renders.
+ *
+ * UAE's business-reviews widget (modules/business-reviews/template-blocks/skin-style.php)
+ * BYPASSES its reviews transient for any logged-in admin and prefixes every fetch with a
+ * hardcoded sleep(2):
+ *     $result = get_transient( $transient_name );
+ *     if ( false === $result || ( is_user_logged_in() && current_user_can( 'manage_options' ) ) ) {
+ *         sleep( 2 ); ... wp_remote_get/post( ..., timeout 60 ) ...
+ * So every ADMIN render of the widget pays 2s + a live Google/Yelp round trip — including the
+ * Elementor editor's remote-render ajax for templates containing the widget. Those slow,
+ * staggered responses widen an Elementor 4.1.5 editor race (onModelRemoteRender:
+ * getContainer().document is null -> "Cannot read properties of null (reading 'id')") that
+ * kills the editor with "The preview could not be loaded" on pages embedding such templates.
+ *
+ * Fix: UAE fires `do_action( 'uael_reviews_transient', $transient_name, $settings )`
+ * IMMEDIATELY before the get_transient + admin-bypass check, and PHP short-circuit means
+ * current_user_can() only runs when the transient EXISTS. So: when a cached copy exists we
+ * register a ONE-SHOT user_has_cap filter that reports manage_options=false for exactly that
+ * single capability check and removes itself in the same call — UAE then renders from its
+ * cache like it does for visitors. When no cache exists we do nothing, so the normal fetch
+ * (and freshness) still happens once, populates the transient, and later renders are instant.
+ * Single-site fleet: WP_User::has_cap always applies user_has_cap (no super-admin early
+ * return outside multisite), so the one-shot consumption is deterministic.
+ */
+add_action(
+	'uael_reviews_transient',
+	function ( $transient_name ) {
+		if ( false === get_transient( $transient_name ) ) {
+			return; // no cache yet — let UAE fetch fresh and store it
+		}
+		$strip = null;
+		$strip = function ( $allcaps, $caps ) use ( &$strip ) {
+			if ( in_array( 'manage_options', (array) $caps, true ) ) {
+				remove_filter( 'user_has_cap', $strip, 99999 ); // one-shot
+				$allcaps['manage_options'] = false;
+			}
+			return $allcaps;
+		};
+		add_filter( 'user_has_cap', $strip, 99999, 2 );
+	},
+	10,
+	1
 );
 
 /**
