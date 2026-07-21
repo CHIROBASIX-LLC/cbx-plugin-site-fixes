@@ -3,7 +3,7 @@
  * Plugin Name: CHIROBASIX Site Fixes
  * Plugin URI:  https://chirobasix.com
  * Description: Agency-wide compatibility fixes for CHIROBASIX client sites. (1) Keeps HighLevel booking calendars/forms and similar embeds out of WP Rocket LazyLoad (filter + saved option) so they render at full height. (2) Collapses RankMath's dual-typed Organization/LocalBusiness schema node to its LocalBusiness subtype so priceRange/openingHours validate (fixes SEMRush "property not recognized by Organization") + strips RankMath's malformed address-less potentialAction org-stub on symptom/service pages (fixes SEMRush "LocalBusiness address required") + derives thumbnailUrl for YouTube VideoObjects missing it (fixes SEMRush "thumbnailUrl required"). Auto-updates from GitHub.
- * Version:     1.5.0
+ * Version:     1.6.0
  * Author:      CHIROBASIX
  * Author URI:  https://chirobasix.com
  * License:     GPL-2.0+
@@ -14,7 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'CBXSF_VERSION', '1.5.0' );
+define( 'CBXSF_VERSION', '1.6.0' );
 
 /**
  * The embed hosts that must never be lazy-loaded or delayed (they self-resize via postMessage
@@ -268,6 +268,113 @@ add_action(
 	},
 	10,
 	1
+);
+
+/**
+ * FIX #6 — WP Schema Pro Local Business emitted with an empty name (and empty NAP).
+ *
+ * On basix-core clones running the Yoast + SmartCrawl + WP Schema Pro stack, Schema Pro's
+ * site-wide "Local Business" schema (type MedicalBusiness) maps its fields to the site's ACF
+ * option tokens (company_name, phone_number, address, city, state, zip). Schema Pro's internal
+ * token resolver returns EMPTY for those on these sites, so it emits a MedicalBusiness with
+ * name=null (+ null telephone/address, empty geo/hours) on every page => SEMRush "A value for
+ * the name field is required" on every URL. The site's ACF company data IS populated, so we
+ * repopulate the node from it at output time via Schema Pro's own filter, and strip the empty
+ * null leftovers so the node validates.
+ *
+ * Inert where it can't help: no `wp_schema_pro_schema_local_business` hook (Schema Pro absent),
+ * name already resolved (only fills when empty), or ACF/company_name unavailable (returns the
+ * node untouched — never invents data, never makes it worse). Per-site off:
+ * add_filter( 'cbxsf_fix_schemapro_localbusiness', '__return_false' );
+ */
+add_filter(
+	'wp_schema_pro_schema_local_business',
+	function ( $schema ) {
+		if ( ! is_array( $schema ) || ! function_exists( 'get_field' ) || ! apply_filters( 'cbxsf_fix_schemapro_localbusiness', true ) ) {
+			return $schema;
+		}
+		$opt = function ( $k ) {
+			$v = get_field( $k, 'option' );
+			return ( is_string( $v ) && '' !== $v ) ? trim( wp_strip_all_tags( $v ) ) : '';
+		};
+
+		// (1) name — the required field. If we have nothing to fill it with, leave the node as-is.
+		if ( empty( $schema['name'] ) ) {
+			$name = $opt( 'company_name' );
+			if ( '' === $name ) {
+				return $schema;
+			}
+			$schema['name'] = $name;
+		}
+
+		// (2) telephone from ACF phone_number (else drop the null key).
+		if ( empty( $schema['telephone'] ) ) {
+			$tel = $opt( 'phone_number' );
+			if ( '' !== $tel ) {
+				$schema['telephone'] = $tel;
+			} else {
+				unset( $schema['telephone'] );
+			}
+		}
+
+		// (3) address from ACF, when Schema Pro left it empty.
+		$addr_empty = empty( $schema['address'] ) || (
+			empty( $schema['address']['streetAddress'] ) && empty( $schema['address']['addressLocality'] ) &&
+			empty( $schema['address']['postalCode'] ) && empty( $schema['address']['addressRegion'] )
+		);
+		if ( $addr_empty ) {
+			$street = $opt( 'address' );
+			$city   = $opt( 'city' );
+			$state  = $opt( 'state' );
+			$zip    = $opt( 'zip' );
+			if ( $street || $city || $state || $zip ) {
+				$schema['address'] = array( '@type' => 'PostalAddress' );
+				if ( $street ) {
+					$schema['address']['streetAddress'] = $street;
+				}
+				if ( $city ) {
+					$schema['address']['addressLocality'] = $city;
+				}
+				if ( $state ) {
+					$schema['address']['addressRegion'] = $state;
+				}
+				if ( $zip ) {
+					$schema['address']['postalCode'] = $zip;
+				}
+				$schema['address']['addressCountry'] = 'US';
+			} else {
+				unset( $schema['address'] );
+			}
+		}
+
+		// (4) strip the empty/null leftovers Schema Pro emits when unmapped.
+		if ( array_key_exists( 'priceRange', $schema ) && empty( $schema['priceRange'] ) ) {
+			unset( $schema['priceRange'] );
+		}
+		if ( array_key_exists( 'telephone', $schema ) && empty( $schema['telephone'] ) ) {
+			unset( $schema['telephone'] );
+		}
+		if ( isset( $schema['geo'] ) && ( empty( $schema['geo']['latitude'] ) || empty( $schema['geo']['longitude'] ) ) ) {
+			unset( $schema['geo'] );
+		}
+		if ( isset( $schema['openingHoursSpecification'] ) && is_array( $schema['openingHoursSpecification'] ) ) {
+			$valid = array();
+			foreach ( $schema['openingHoursSpecification'] as $h ) {
+				$days = isset( $h['dayOfWeek'] ) ? array_filter( (array) $h['dayOfWeek'] ) : array();
+				if ( ! empty( $days ) && ! empty( $h['opens'] ) && ! empty( $h['closes'] ) ) {
+					$valid[] = $h;
+				}
+			}
+			if ( $valid ) {
+				$schema['openingHoursSpecification'] = array_values( $valid );
+			} else {
+				unset( $schema['openingHoursSpecification'] );
+			}
+		}
+
+		return $schema;
+	},
+	20
 );
 
 /**
