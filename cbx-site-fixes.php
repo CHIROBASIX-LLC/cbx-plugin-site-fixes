@@ -3,7 +3,7 @@
  * Plugin Name: CHIROBASIX Site Fixes
  * Plugin URI:  https://chirobasix.com
  * Description: Agency-wide compatibility fixes for CHIROBASIX client sites. (1) Keeps HighLevel booking calendars/forms and similar embeds out of WP Rocket LazyLoad (filter + saved option) so they render at full height. (2) Collapses RankMath's dual-typed Organization/LocalBusiness schema node to its LocalBusiness subtype so priceRange/openingHours validate (fixes SEMRush "property not recognized by Organization") + strips RankMath's malformed address-less potentialAction org-stub on symptom/service pages (fixes SEMRush "LocalBusiness address required") + derives thumbnailUrl for YouTube VideoObjects missing it (fixes SEMRush "thumbnailUrl required"). Auto-updates from GitHub.
- * Version:     1.6.0
+ * Version:     1.7.0
  * Author:      CHIROBASIX
  * Author URI:  https://chirobasix.com
  * License:     GPL-2.0+
@@ -14,7 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'CBXSF_VERSION', '1.6.0' );
+define( 'CBXSF_VERSION', '1.7.0' );
 
 /**
  * The embed hosts that must never be lazy-loaded or delayed (they self-resize via postMessage
@@ -375,6 +375,55 @@ add_filter(
 		return $schema;
 	},
 	20
+);
+
+/**
+ * FIX #7 — UAE Business Reviews "Read More" link resolves to an internal 404.
+ *
+ * Ultimate Elementor builds each review's read-more href in
+ * modules/business-reviews/template-blocks/skin-style.php as:
+ *
+ *     $user_review_url = explode( '/reviews', $value->author_url );
+ *     $review_url      = $user_review_url[0] . '/place/' . $settings['place_id'];
+ *
+ * When Google returns a review with no author attribution URL (anonymous reviewer),
+ * $value->author_url is '' and explode() yields array( '' ), so the href collapses to the
+ * ROOT-RELATIVE "/place/<place_id>". Browsers and crawlers resolve that against the site, i.e.
+ * https://<client>.com/place/ChIJ... => a 404 on every page the widget renders (SEMRush
+ * "internal links are broken"). Which reviews are shown rotates as UAE refreshes its cached
+ * feed, so the broken link appears and disappears without anyone touching the site.
+ *
+ * We repair only the href, through UAE's own filter, rewriting a non-absolute value to Google's
+ * canonical Maps URL for the same place id so the link points where it was meant to. Link text,
+ * classes and surrounding markup are untouched, so nothing renders differently.
+ *
+ * Inert where it can't help: absolute URLs pass through byte-for-byte, and a value we can't
+ * parse a place id out of is returned as-is (never invents a destination). Per-site off:
+ * add_filter( 'cbxsf_fix_uael_review_read_more', '__return_false' );
+ */
+add_filter(
+	'uael_business_reviews_read_more',
+	function ( $url ) {
+		if ( ! apply_filters( 'cbxsf_fix_uael_review_read_more', true ) ) {
+			return $url;
+		}
+
+		$candidate = trim( (string) $url );
+
+		// Already a real off-site link — leave it exactly as UAE built it.
+		if ( '' !== $candidate && preg_match( '#^https?://#i', $candidate ) ) {
+			return $url;
+		}
+
+		// Recover the place id UAE appended and rebuild it as an absolute Google Maps URL.
+		if ( preg_match( '#(?:^|/)place/([A-Za-z0-9_-]+)#', $candidate, $matches ) ) {
+			return 'https://www.google.com/maps/place/?q=place_id:' . rawurlencode( $matches[1] );
+		}
+
+		return $url;
+	},
+	10,
+	1
 );
 
 /**
