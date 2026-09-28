@@ -3,7 +3,7 @@
  * Plugin Name: CHIROBASIX Site Fixes
  * Plugin URI:  https://chirobasix.com
  * Description: Agency-wide compatibility fixes for CHIROBASIX client sites. (1) Keeps HighLevel booking calendars/forms and similar embeds out of WP Rocket LazyLoad (filter + saved option) so they render at full height. (2) Collapses RankMath's dual-typed Organization/LocalBusiness schema node to its LocalBusiness subtype so priceRange/openingHours validate (fixes SEMRush "property not recognized by Organization") + strips RankMath's malformed address-less potentialAction org-stub on symptom/service pages (fixes SEMRush "LocalBusiness address required") + derives thumbnailUrl for YouTube VideoObjects missing it (fixes SEMRush "thumbnailUrl required"). Auto-updates from GitHub.
- * Version:     1.8.0
+ * Version:     1.9.0
  * Author:      CHIROBASIX
  * Author URI:  https://chirobasix.com
  * License:     GPL-2.0+
@@ -14,7 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'CBXSF_VERSION', '1.8.0' );
+define( 'CBXSF_VERSION', '1.9.0' );
 
 /**
  * The embed hosts that must never be lazy-loaded or delayed (they self-resize via postMessage
@@ -468,6 +468,153 @@ add_filter(
 		return apply_filters( 'cbxsf_strip_person_email', true ) ? cbxsf_strip_person_email( $graph ) : $graph;
 	},
 	99999
+);
+
+/**
+ * FIX #9 — Yoast breadcrumbs show raw ACF shortcodes: 'Top Chiropractor in [acf field="city" post_id="options"]'.
+ *
+ * Template page titles contain ACF shortcodes. Themes run them through the_title, so the page looks right, but
+ * Yoast builds each breadcrumb (and the BreadcrumbList Google reads) from the raw title. This runs the shortcode on
+ * each crumb, then strips tags. Crumbs without a '[' are untouched. Found on 72 of 100 Yoast sites (9/28).
+ *
+ * Per-site off: add_filter( 'cbxsf_fix_breadcrumb_shortcodes', '__return_false' );
+ */
+add_filter(
+	'wpseo_breadcrumb_links',
+	function ( $links ) {
+		if ( ! is_array( $links ) || ! apply_filters( 'cbxsf_fix_breadcrumb_shortcodes', true ) ) {
+			return $links;
+		}
+		foreach ( $links as $i => $link ) {
+			if ( isset( $link['text'] ) && is_string( $link['text'] ) && false !== strpos( $link['text'], '[' ) ) {
+				$links[ $i ]['text'] = trim( preg_replace( '/\s+/', ' ', wp_strip_all_tags( do_shortcode( $link['text'] ) ) ) );
+			}
+		}
+		return $links;
+	},
+	99999
+);
+
+/**
+ * FIX #10 — Sitemaps list addresses that only redirect.
+ *
+ * (a) JetMenu's 'jet-menu' mega-menu blocks are a public post type, so Yoast and Rank Math list them in the
+ *     sitemap; each one 302s to the homepage. They are never pages: excluded.
+ * (b) Template post-type archives (/services/, /symptoms/ ...) 301 to the homepage on most sites but stay in the
+ *     sitemap. The archive link is dropped only when the archive URL really answers with a redirect (checked with
+ *     one HEAD request per post type, cached for a day; any error keeps the link).
+ *
+ * Per-site off: add_filter( 'cbxsf_fix_sitemap_redirects', '__return_false' );
+ */
+function cbxsf_archive_redirects( $post_type ) {
+	$key  = 'cbxsf_arch_' . md5( $post_type );
+	$code = get_transient( $key );
+	if ( false === $code ) {
+		$url  = get_post_type_archive_link( $post_type );
+		$resp = $url ? wp_remote_head( $url, array( 'redirection' => 0, 'timeout' => 5, 'sslverify' => false ) ) : null;
+		$code = ( $resp && ! is_wp_error( $resp ) ) ? (int) wp_remote_retrieve_response_code( $resp ) : 0;
+		set_transient( $key, $code, DAY_IN_SECONDS );
+	}
+	return in_array( (int) $code, array( 301, 302, 307, 308 ), true );
+}
+add_filter(
+	'wpseo_sitemap_exclude_post_type',
+	function ( $excluded, $post_type ) {
+		return ( 'jet-menu' === $post_type && apply_filters( 'cbxsf_fix_sitemap_redirects', true ) ) ? true : $excluded;
+	},
+	10,
+	2
+);
+add_filter(
+	'rank_math/sitemap/exclude_post_type',
+	function ( $exclude, $post_type ) {
+		return ( 'jet-menu' === $post_type && apply_filters( 'cbxsf_fix_sitemap_redirects', true ) ) ? true : $exclude;
+	},
+	10,
+	2
+);
+foreach ( array( 'wpseo_sitemap_post_type_archive_link', 'rank_math/sitemap/post_type_archive_link' ) as $cbxsf_hook ) {
+	add_filter(
+		$cbxsf_hook,
+		function ( $link, $post_type ) {
+			if ( ! $link || ! apply_filters( 'cbxsf_fix_sitemap_redirects', true ) ) {
+				return $link;
+			}
+			return cbxsf_archive_redirects( $post_type ) ? false : $link;
+		},
+		10,
+		2
+	);
+}
+
+/**
+ * FIX #11 — Paid-ad landing pages are open to Google.
+ *
+ * Elementor landing pages (post type e-landing-page: lp-back-pain, lp-top-chiropractor ...) carry the same ad copy
+ * on many practices' domains and compete with each site's real service pages. They stay live for the ads but get
+ * noindex (Yoast, Rank Math, or WordPress core when neither is active) and leave the sitemap. Nick 9/28.
+ *
+ * Per-site off: add_filter( 'cbxsf_noindex_landing_pages', '__return_false' );
+ */
+function cbxsf_is_landing_page() {
+	return apply_filters( 'cbxsf_noindex_landing_pages', true ) && is_singular( 'e-landing-page' );
+}
+add_filter(
+	'wpseo_robots_array',
+	function ( $robots ) {
+		if ( is_array( $robots ) && cbxsf_is_landing_page() ) {
+			$robots['index'] = 'noindex';
+		}
+		return $robots;
+	},
+	99999
+);
+add_filter(
+	'rank_math/frontend/robots',
+	function ( $robots ) {
+		if ( is_array( $robots ) && cbxsf_is_landing_page() ) {
+			unset( $robots['index'] );
+			$robots['noindex'] = 'noindex';
+		}
+		return $robots;
+	},
+	99999
+);
+add_filter(
+	'wp_robots',
+	function ( $robots ) {
+		if ( cbxsf_is_landing_page() ) {
+			$robots['noindex'] = true;
+			unset( $robots['index'] );
+		}
+		return $robots;
+	},
+	99999
+);
+add_filter(
+	'wpseo_sitemap_exclude_post_type',
+	function ( $excluded, $post_type ) {
+		return ( 'e-landing-page' === $post_type && apply_filters( 'cbxsf_noindex_landing_pages', true ) ) ? true : $excluded;
+	},
+	10,
+	2
+);
+add_filter(
+	'rank_math/sitemap/exclude_post_type',
+	function ( $exclude, $post_type ) {
+		return ( 'e-landing-page' === $post_type && apply_filters( 'cbxsf_noindex_landing_pages', true ) ) ? true : $exclude;
+	},
+	10,
+	2
+);
+add_filter(
+	'wp_sitemaps_post_types',
+	function ( $types ) {
+		if ( apply_filters( 'cbxsf_noindex_landing_pages', true ) ) {
+			unset( $types['e-landing-page'] );
+		}
+		return $types;
+	}
 );
 
 /**
