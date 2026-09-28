@@ -3,7 +3,7 @@
  * Plugin Name: CHIROBASIX Site Fixes
  * Plugin URI:  https://chirobasix.com
  * Description: Agency-wide compatibility fixes for CHIROBASIX client sites. (1) Keeps HighLevel booking calendars/forms and similar embeds out of WP Rocket LazyLoad (filter + saved option) so they render at full height. (2) Collapses RankMath's dual-typed Organization/LocalBusiness schema node to its LocalBusiness subtype so priceRange/openingHours validate (fixes SEMRush "property not recognized by Organization") + strips RankMath's malformed address-less potentialAction org-stub on symptom/service pages (fixes SEMRush "LocalBusiness address required") + derives thumbnailUrl for YouTube VideoObjects missing it (fixes SEMRush "thumbnailUrl required"). Auto-updates from GitHub.
- * Version:     1.9.0
+ * Version:     1.9.1
  * Author:      CHIROBASIX
  * Author URI:  https://chirobasix.com
  * License:     GPL-2.0+
@@ -14,7 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'CBXSF_VERSION', '1.9.0' );
+define( 'CBXSF_VERSION', '1.9.1' );
 
 /**
  * The embed hosts that must never be lazy-loaded or delayed (they self-resize via postMessage
@@ -491,6 +491,29 @@ add_filter(
 			}
 		}
 		return $links;
+	},
+	99999
+);
+
+/**
+ * FIX #9b — Schema Pro prints its own BreadcrumbList (next to Yoast's) from the same raw titles, so Google still
+ * read 'Top Chiropractor in [acf field="city" ...]' on 18 Schema Pro sites after FIX #9. Same treatment here.
+ * Schema Pro caches its output in post meta 'wp_schema_pro_optimized_structured_data': clear it after updating.
+ * Per-site off: the same 'cbxsf_fix_breadcrumb_shortcodes' filter.
+ */
+add_filter(
+	'wp_schema_pro_global_schema_breadcrumb',
+	function ( $schema ) {
+		if ( ! is_array( $schema ) || empty( $schema['itemListElement'] ) || ! apply_filters( 'cbxsf_fix_breadcrumb_shortcodes', true ) ) {
+			return $schema;
+		}
+		foreach ( $schema['itemListElement'] as $i => $item ) {
+			$name = $item['item']['name'] ?? null;
+			if ( is_string( $name ) && false !== strpos( $name, '[' ) ) {
+				$schema['itemListElement'][ $i ]['item']['name'] = trim( preg_replace( '/\s+/', ' ', wp_strip_all_tags( do_shortcode( $name ) ) ) );
+			}
+		}
+		return $schema;
 	},
 	99999
 );
