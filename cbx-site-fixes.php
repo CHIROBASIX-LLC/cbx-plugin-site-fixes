@@ -3,7 +3,7 @@
  * Plugin Name: CHIROBASIX Site Fixes
  * Plugin URI:  https://chirobasix.com
  * Description: Agency-wide compatibility fixes for CHIROBASIX client sites. (1) Keeps HighLevel booking calendars/forms and similar embeds out of WP Rocket LazyLoad (filter + saved option) so they render at full height. (2) Collapses RankMath's dual-typed Organization/LocalBusiness schema node to its LocalBusiness subtype so priceRange/openingHours validate (fixes SEMRush "property not recognized by Organization") + strips RankMath's malformed address-less potentialAction org-stub on symptom/service pages (fixes SEMRush "LocalBusiness address required") + derives thumbnailUrl for YouTube VideoObjects missing it (fixes SEMRush "thumbnailUrl required"). Auto-updates from GitHub.
- * Version:     1.7.0
+ * Version:     1.8.0
  * Author:      CHIROBASIX
  * Author URI:  https://chirobasix.com
  * License:     GPL-2.0+
@@ -14,7 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'CBXSF_VERSION', '1.7.0' );
+define( 'CBXSF_VERSION', '1.8.0' );
 
 /**
  * The embed hosts that must never be lazy-loaded or delayed (they self-resize via postMessage
@@ -424,6 +424,50 @@ add_filter(
 	},
 	10,
 	1
+);
+
+/**
+ * FIX #8 — Author email addresses published in structured data.
+ *
+ * The basix-core-child theme builds a Person for each page/post author (rankmath_build_person_schema)
+ * and copies the author's WordPress LOGIN email into it (`get_the_author_meta( 'user_email' )`). On
+ * template clones that published the demo account's agency email on every service page; once pages are
+ * credited to the practice's doctor it would publish the doctor's private login address instead. No
+ * search feature uses a Person email. This removes `email` from every Person object anywhere in the
+ * graph (top-level nodes and nested author/employee/performer objects). Business emails on
+ * Organization / LocalBusiness nodes are left alone. Runs last on Rank Math (theme hooks run at
+ * 150-170) and on Yoast.
+ *
+ * Per-site off: add_filter( 'cbxsf_strip_person_email', '__return_false' );
+ */
+function cbxsf_strip_person_email( $node ) {
+	if ( ! is_array( $node ) ) {
+		return $node;
+	}
+	if ( isset( $node['@type'] ) && in_array( 'Person', (array) $node['@type'], true ) ) {
+		unset( $node['email'] );
+	}
+	foreach ( $node as $k => $v ) {
+		if ( is_array( $v ) ) {
+			$node[ $k ] = cbxsf_strip_person_email( $v );
+		}
+	}
+	return $node;
+}
+add_filter(
+	'rank_math/json_ld',
+	function ( $data, $jsonld ) {
+		return apply_filters( 'cbxsf_strip_person_email', true ) ? cbxsf_strip_person_email( $data ) : $data;
+	},
+	99999,
+	2
+);
+add_filter(
+	'wpseo_schema_graph',
+	function ( $graph ) {
+		return apply_filters( 'cbxsf_strip_person_email', true ) ? cbxsf_strip_person_email( $graph ) : $graph;
+	},
+	99999
 );
 
 /**
