@@ -2,8 +2,8 @@
 /**
  * Plugin Name: CHIROBASIX Site Fixes
  * Plugin URI:  https://chirobasix.com
- * Description: Agency-wide compatibility fixes for CHIROBASIX client sites. (1) Keeps HighLevel booking calendars/forms and similar embeds out of WP Rocket LazyLoad (filter + saved option) so they render at full height. (2) Collapses RankMath's dual-typed Organization/LocalBusiness schema node to its LocalBusiness subtype so priceRange/openingHours validate (fixes SEMRush "property not recognized by Organization") + strips RankMath's malformed address-less potentialAction org-stub on symptom/service pages (fixes SEMRush "LocalBusiness address required") + derives thumbnailUrl for YouTube VideoObjects missing it (fixes SEMRush "thumbnailUrl required"). Auto-updates from GitHub.
- * Version:     1.9.1
+ * Description: Agency-wide compatibility fixes for CHIROBASIX client sites. (1) Keeps HighLevel booking calendars/forms and similar embeds out of WP Rocket LazyLoad (filter + saved option) so they render at full height. (2) Collapses RankMath's dual-typed Organization/LocalBusiness schema node to its LocalBusiness subtype so priceRange/openingHours validate (fixes SEMRush "property not recognized by Organization") + strips RankMath's malformed address-less potentialAction org-stub on symptom/service pages (fixes SEMRush "LocalBusiness address required") + derives thumbnailUrl for YouTube VideoObjects missing it (fixes SEMRush "thumbnailUrl required"). (3) Opt-in fixes (1.10.0+), OFF unless the site lists the fix in option cbxsf_optin: [acf] shortcodes in SEO titles, Rank Math service/symptom schema clean-up, WP Rocket cache-poisoning guards, WP Rocket Lazy Render off. Auto-updates from GitHub.
+ * Version:     1.10.0
  * Author:      CHIROBASIX
  * Author URI:  https://chirobasix.com
  * License:     GPL-2.0+
@@ -14,7 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'CBXSF_VERSION', '1.9.1' );
+define( 'CBXSF_VERSION', '1.10.0' );
 
 /**
  * The embed hosts that must never be lazy-loaded or delayed (they self-resize via postMessage
@@ -84,9 +84,10 @@ function cbxsf_sync_rocket_options() {
 	$changed = false;
 	foreach ( array( 'exclude_lazyload' => $hosts, 'delay_js_exclusions' => $scripts, 'exclude_defer_js' => $scripts ) as $key => $adds ) {
 		$cur = isset( $settings[ $key ] ) && is_array( $settings[ $key ] ) ? $settings[ $key ] : array();
-		$new = array_values( array_unique( array_merge( $cur, $adds ) ) );
-		if ( count( $new ) !== count( $cur ) ) {
-			$settings[ $key ] = $new;
+		// Write only when an entry is really missing (1.10.0): a duplicate the site already has is not a reason to
+		// rewrite WP Rocket's options, regenerate its config and clear the whole cache on a version bump.
+		if ( array_diff( $adds, $cur ) ) {
+			$settings[ $key ] = array_values( array_unique( array_merge( $cur, $adds ) ) );
 			$changed          = true;
 		}
 	}
@@ -639,6 +640,546 @@ add_filter(
 		return $types;
 	}
 );
+
+/* cbxsf-optin-begin ===================================================================================
+ * OPT-IN FIXES (1.10.0+): FIX #12 to FIX #15.
+ *
+ * This plugin auto-updates on every install, including set-aside and skipped ones, so every fix below is OFF
+ * unless the site lists its key in the option `cbxsf_optin` (an array of keys, written by the rollout script on
+ * the installs that should get it). With the option absent none of these hooks is registered and the plugin
+ * behaves exactly like 1.9.1.
+ *
+ *   Keys:    acf_titles (FIX #12), rm_nodes (FIX #13), cache_guards (FIX #14), lrc_off (FIX #15)
+ *   Enable:  wp option update cbxsf_optin '["rm_nodes","acf_titles"]' --format=json --autoload=yes
+ *   Undo:    remove the key from the array (or delete the option), then purge. cache_guards also needs
+ *            cbxsf_regen_rocket_config() again, because WP Rocket keeps the old values in its config file.
+ *   Veto:    add_filter( 'cbxsf_fix_<key>', '__return_false' ) in a site mu-plugin or the theme (checked when the
+ *            fix runs). The names used in the 9/28 findings also work: cbxsf_fix_title_shortcodes,
+ *            cbxsf_rm_node_cleanup, cbxsf_cache_guards, cbxsf_disable_lazy_render.
+ */
+
+/** True only when option `cbxsf_optin` is an array that lists $key. */
+function cbxsf_optin( $key ) {
+	$on = get_option( 'cbxsf_optin' );
+	return is_array( $on ) && in_array( $key, $on, true );
+}
+
+/** Opted in AND not vetoed by the site (checked each time a fix runs, so a theme filter counts too). */
+function cbxsf_fix_active( $key ) {
+	if ( ! cbxsf_optin( $key ) ) {
+		return false;
+	}
+	$aliases = array(
+		'acf_titles'   => 'cbxsf_fix_title_shortcodes',
+		'rm_nodes'     => 'cbxsf_rm_node_cleanup',
+		'cache_guards' => 'cbxsf_cache_guards',
+		'lrc_off'      => 'cbxsf_disable_lazy_render',
+	);
+	if ( isset( $aliases[ $key ] ) && ! apply_filters( $aliases[ $key ], true ) ) {
+		return false;
+	}
+	return (bool) apply_filters( 'cbxsf_fix_' . $key, true );
+}
+
+/**
+ * FIX #12 (key acf_titles) — Raw '[acf field="city" post_id="options"]' in SEO titles and image text.
+ *
+ * The /lp-top-chiropractor/ ad page's post_title is 'Top Chiropractor in [acf field="city" post_id="options"]' (the
+ * template system: never edited). Yoast and Rank Math build <title>, og:title, twitter:title, og:image:alt and the
+ * Yoast WebPage name from that raw title (70 sites). On Rank Math sites Image SEO also writes it into every image's
+ * alt= and title= (img_alt_format '%title%'), 38 to 54 times per page, on the_content at priority 11.
+ * Strings containing '[acf' get do_shortcode + wp_strip_all_tags, whitespace trimmed and collapsed (bullchiro's
+ * Company Info city starts with a space). Images: only on a post whose post_title contains '[acf', and only inside
+ * alt= / title= attribute values. Anything without '[acf' passes through byte-for-byte.
+ */
+function cbxsf_resolve_acf( $s ) {
+	if ( ! is_string( $s ) || false === strpos( $s, '[acf' ) ) {
+		return $s;
+	}
+	// Quotes inside the shortcode may arrive entity-encoded; decode them inside the shortcode only, so it parses.
+	$d = preg_replace_callback(
+		'/\[acf\b[^\]]*\]/',
+		function ( $m ) {
+			return html_entity_decode( $m[0], ENT_QUOTES | ENT_HTML5, 'UTF-8' );
+		},
+		$s
+	);
+	$r = preg_replace( '/\s+/u', ' ', wp_strip_all_tags( do_shortcode( null === $d ? $s : $d ) ) );
+	return null === $r ? $s : trim( $r ); // a regex failure (invalid UTF-8) leaves the string as it was
+}
+function cbxsf_acf_title( $s ) {
+	if ( ! is_string( $s ) || false === strpos( $s, '[acf' ) || ! cbxsf_fix_active( 'acf_titles' ) ) {
+		return $s;
+	}
+	return cbxsf_resolve_acf( $s );
+}
+function cbxsf_acf_img_attrs( $html, $post_id = null ) {
+	if ( ! is_string( $html ) || false === strpos( $html, 'acf' ) ) {
+		return $html;
+	}
+	$post = get_post( $post_id );
+	if ( ! $post || false === strpos( (string) $post->post_title, '[acf' ) || ! cbxsf_fix_active( 'acf_titles' ) ) {
+		return $html;
+	}
+	$out = preg_replace_callback(
+		'/<[a-zA-Z][^>]*\s(?:alt|title)\s*=[^>]*>/',
+		function ( $tag ) {
+			$t = preg_replace_callback(
+				'/(\s(?:alt|title)\s*=\s*)(?:"([^"]*)"|\'([^\']*)\')/i',
+				function ( $m ) {
+					$val = html_entity_decode( isset( $m[3] ) ? $m[3] : $m[2], ENT_QUOTES | ENT_HTML5, 'UTF-8' );
+					if ( false === strpos( $val, '[acf' ) ) {
+						return $m[0];
+					}
+					return $m[1] . '"' . esc_attr( cbxsf_resolve_acf( $val ) ) . '"';
+				},
+				$tag[0]
+			);
+			return null === $t ? $tag[0] : $t;
+		},
+		$html
+	);
+	return null === $out ? $html : $out; // never blank the content on a regex failure
+}
+if ( cbxsf_optin( 'acf_titles' ) ) {
+	foreach ( array( 'wpseo_title', 'wpseo_opengraph_title', 'wpseo_twitter_title', 'rank_math/frontend/title', 'rank_math/opengraph/facebook/og_title', 'rank_math/opengraph/twitter/twitter_title', 'rank_math/opengraph/facebook/og_image_alt' ) as $cbxsf_hook ) {
+		add_filter( $cbxsf_hook, 'cbxsf_acf_title', 99999 );
+	}
+	add_filter(
+		'wpseo_schema_webpage',
+		function ( $piece ) {
+			if ( is_array( $piece ) && isset( $piece['name'] ) ) {
+				$piece['name'] = cbxsf_acf_title( $piece['name'] );
+			}
+			return $piece;
+		},
+		99999
+	);
+	add_filter( 'the_content', 'cbxsf_acf_img_attrs', 99999 );            // after Rank Math add_img_attributes (11)
+	add_filter( 'post_thumbnail_html', 'cbxsf_acf_img_attrs', 99999, 2 );
+}
+
+/**
+ * FIX #13 (key rm_nodes) — Rank Math service/symptom schema clean-up (33 queued Rank Math clinic sites).
+ *
+ * rank_math/json_ld at 99999 (after the basix-core-child theme at 150-180, a per-site cbx-seo-fixes template at 999
+ * and FIX #3/#4/#8 above), recursive over nested nodes. Only JSON-LD and the Slack preview rows change.
+ *  (a) performer, usedToTreat, indication removed from MedicalProcedure / Service / MedicalTherapy nodes (theme
+ *      rankmath_enrich_service_schema_with_author + an ACF field; not schema.org on those types).
+ *  (b) the Services template gives the procedure node '%url%#webpage', the same @id as Rank Math's WebPage: on those
+ *      three types only, '#webpage' becomes '#service'. WebPage and its subtypes are never renamed (charleschiro prints
+ *      AboutPage/ContactPage on #webpage). A bare {"@id"} reference is re-pointed only when no other node still holds
+ *      the old id (otherwise it points at the WebPage and stays).
+ *  (c) procedure/service named 'Top|Premium|Experienced Chiropractor' (optionally ' in <town>') -> 'Chiropractic Care'.
+ *  (d) an Offer with no price is dropped ('New Patient Special' with a relative url and no price).
+ *  (e) every `name` string is entity-decoded, and '&amp;' in Rank Math's printed ld+json becomes '&' again (literal
+ *      '&amp;' on brickrosechiro, alphaspine810, palmharbor743, pravowelln632: see cbxsf_rm_head_close()).
+ *  (f) a description with a blank token (starts ' is proud' / space + lowercase, or has 'in , ', 'at , ', 'in .') is
+ *      replaced by the page's Rank Math meta description when that is clean, else removed. The fallback is used only
+ *      on nodes that describe the page (service types, MedicalCondition, Article, WebPage types); other nodes (a
+ *      Person, the business) just lose the broken description.
+ *  (g) the agency account (name 'BASIX', @id/url with '/team/basixadmin', sameAs thinkbasix.com) is removed from
+ *      employee / performer / author (empty lists dropped), a top-level BASIX Person node is removed, and an Article
+ *      credited to it on a non-blog singular page (symptom pages) is removed. Slack preview: the 'Written by BASIX' row.
+ *  (h) `gender` removed from every Person (unchecked profile field; female doctors printed 'Male'). No usermeta writes.
+ *  (i) MedicalCondition code / signOrSymptom / riskFactor / differentialDiagnosis removed only when, after trimming a
+ *      trailing comma, the value is empty, ',', '[]' or not valid JSON. Populated values stay word for word.
+ * Idempotent with the per-site template (it strips performer/usedToTreat on top-level nodes at 999; this finds none left).
+ */
+function cbxsf_rm_type_list( $node ) {
+	if ( ! is_array( $node ) || ! isset( $node['@type'] ) ) {
+		return array();
+	}
+	return array_values( array_filter( (array) $node['@type'], 'is_string' ) );
+}
+function cbxsf_rm_is_list( $a ) {
+	$i = 0;
+	foreach ( $a as $k => $unused ) {
+		if ( $k !== $i++ ) {
+			return false;
+		}
+	}
+	return true;
+}
+function cbxsf_rm_page_types() {
+	return array( 'WebPage', 'AboutPage', 'CheckoutPage', 'CollectionPage', 'ContactPage', 'FAQPage', 'ItemPage', 'MedicalWebPage', 'ProfilePage', 'QAPage', 'RealEstateListing', 'SearchResultsPage', 'MediaGallery', 'ImageGallery', 'VideoGallery' );
+}
+function cbxsf_rm_is_agency( $p ) {
+	if ( is_string( $p ) ) {
+		return 0 === strcasecmp( trim( $p ), 'BASIX' );
+	}
+	if ( ! is_array( $p ) ) {
+		return false;
+	}
+	$types = cbxsf_rm_type_list( $p );
+	if ( $types && ! in_array( 'Person', $types, true ) ) {
+		return false;
+	}
+	if ( isset( $p['name'] ) && is_string( $p['name'] ) && 0 === strcasecmp( trim( $p['name'] ), 'BASIX' ) ) {
+		return true;
+	}
+	foreach ( array( '@id', 'url' ) as $k ) {
+		if ( isset( $p[ $k ] ) && is_string( $p[ $k ] ) && false !== stripos( $p[ $k ], '/team/basixadmin' ) ) {
+			return true;
+		}
+	}
+	if ( isset( $p['sameAs'] ) ) {
+		foreach ( (array) $p['sameAs'] as $s ) {
+			if ( is_string( $s ) && false !== stripos( $s, 'thinkbasix.com' ) ) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+function cbxsf_rm_is_priceless_offer( $v ) {
+	if ( ! in_array( 'Offer', cbxsf_rm_type_list( $v ), true ) ) {
+		return false;
+	}
+	if ( isset( $v['price'] ) && ( is_int( $v['price'] ) || is_float( $v['price'] ) || ( is_string( $v['price'] ) && '' !== trim( $v['price'] ) ) ) ) {
+		return false;
+	}
+	return empty( $v['priceSpecification'] );
+}
+/** (d) a priceless Offer anywhere; (g) the agency Person in an employee / performer / author slot. */
+function cbxsf_rm_drop( $x, $agency_slot ) {
+	return cbxsf_rm_is_priceless_offer( $x ) || ( $agency_slot && cbxsf_rm_is_agency( $x ) );
+}
+function cbxsf_rm_decode( $s ) {
+	for ( $i = 0; $i < 3 && false !== strpos( $s, '&' ); $i++ ) {
+		$d = html_entity_decode( $s, ENT_QUOTES | ENT_HTML5, 'UTF-8' );
+		if ( $d === $s ) {
+			break;
+		}
+		$s = $d;
+	}
+	return $s;
+}
+function cbxsf_rm_blank_desc( $s ) {
+	return is_string( $s ) && (
+		preg_match( '/^\s+\p{Ll}/u', $s )                  // ' is proud to offer ...': the name at the start is blank
+		|| preg_match( '/^\s*is proud\b/i', $s )
+		|| preg_match( '/\b(?:in|at)\s+[,.](?=\s|$)/i', $s ) // 'At , we focus', 'in , TN', 'office in .'
+	);
+}
+function cbxsf_rm_meta_description() {
+	if ( ! class_exists( '\RankMath\Paper\Paper' ) ) {
+		return '';
+	}
+	try {
+		$d = (string) \RankMath\Paper\Paper::get()->get_description();
+	} catch ( \Throwable $e ) {
+		return '';
+	}
+	$d = trim( (string) preg_replace( '/\s+/u', ' ', wp_strip_all_tags( html_entity_decode( $d, ENT_QUOTES | ENT_HTML5, 'UTF-8' ) ) ) );
+	return ( '' !== $d && ! cbxsf_rm_blank_desc( $d ) ) ? $d : '';
+}
+function cbxsf_rm_junk_list( $v ) {
+	if ( is_array( $v ) ) {
+		return empty( $v );
+	}
+	if ( ! is_string( $v ) ) {
+		return false;
+	}
+	$s = trim( (string) preg_replace( '/,\s*$/', '', trim( $v ) ) );
+	if ( '' === $s || ',' === $s || '[]' === $s ) {
+		return true;
+	}
+	$d = json_decode( $s, true );
+	if ( JSON_ERROR_NONE !== json_last_error() ) {
+		return true; // not valid JSON
+	}
+	return null === $d || '' === $d || array() === $d;
+}
+function cbxsf_rm_collect_ids( $node, &$ids ) {
+	if ( ! is_array( $node ) ) {
+		return;
+	}
+	if ( isset( $node['@id'], $node['@type'] ) && is_string( $node['@id'] ) ) {
+		$ids[ $node['@id'] ] = isset( $ids[ $node['@id'] ] ) ? $ids[ $node['@id'] ] + 1 : 1;
+	}
+	foreach ( $node as $v ) {
+		cbxsf_rm_collect_ids( $v, $ids );
+	}
+}
+function cbxsf_rm_remap_refs( $node, $map ) {
+	if ( ! is_array( $node ) ) {
+		return $node;
+	}
+	if ( ! isset( $node['@type'] ) && isset( $node['@id'] ) && is_string( $node['@id'] ) && isset( $map[ $node['@id'] ] ) ) {
+		$node['@id'] = $map[ $node['@id'] ];
+	}
+	foreach ( $node as $k => $v ) {
+		if ( is_array( $v ) ) {
+			$node[ $k ] = cbxsf_rm_remap_refs( $v, $map );
+		}
+	}
+	return $node;
+}
+function cbxsf_rm_clean( $node, &$ctx ) {
+	if ( ! is_array( $node ) ) {
+		return $node;
+	}
+	$types     = cbxsf_rm_type_list( $node );
+	$is_page   = (bool) array_intersect( $types, cbxsf_rm_page_types() );
+	$is_svc    = (bool) array_intersect( $types, array( 'MedicalProcedure', 'Service', 'MedicalTherapy' ) );
+	$describes = $is_svc || $is_page || array_intersect( $types, array( 'MedicalCondition', 'Article', 'BlogPosting', 'NewsArticle' ) );
+	if ( $is_svc ) {
+		unset( $node['performer'], $node['usedToTreat'], $node['indication'] );                                  // (a)
+		if ( ! $is_page && isset( $node['@id'] ) && is_string( $node['@id'] ) && '#webpage' === substr( $node['@id'], -8 ) ) {
+			$new = substr( $node['@id'], 0, -8 ) . '#service';                                                   // (b)
+			if ( empty( $ctx['ids'][ $new ] ) ) {
+				$ctx['renamed'][ $node['@id'] ] = $new;
+				$ctx['ids'][ $new ]             = 1;
+				$node['@id']                    = $new;
+			}
+		}
+		if ( isset( $node['name'] ) && is_string( $node['name'] ) ) {                                            // (e) then (c)
+			$node['name'] = cbxsf_rm_decode( $node['name'] );
+			if ( preg_match( '/^\s*(?:Top|Premium|Experienced)\s+Chiropractor(\s+in\s+\S.*)?\s*$/iu', $node['name'], $m ) ) {
+				$node['name'] = 'Chiropractic Care' . ( isset( $m[1] ) ? ' ' . trim( $m[1] ) : '' );
+			}
+		}
+	}
+	if ( in_array( 'Person', $types, true ) ) {
+		unset( $node['gender'] );                                                                               // (h)
+	}
+	if ( in_array( 'MedicalCondition', $types, true ) ) {
+		foreach ( array( 'code', 'signOrSymptom', 'riskFactor', 'differentialDiagnosis' ) as $f ) {              // (i)
+			if ( array_key_exists( $f, $node ) && cbxsf_rm_junk_list( $node[ $f ] ) ) {
+				unset( $node[ $f ] );
+			}
+		}
+	}
+	foreach ( $node as $k => $v ) {
+		if ( 'name' === $k && is_string( $v ) ) {
+			$node[ $k ] = cbxsf_rm_decode( $v );                                                                 // (e)
+			continue;
+		}
+		if ( 'description' === $k && is_string( $v ) ) {
+			if ( cbxsf_rm_blank_desc( $v ) ) {                                                                   // (f)
+				$fallback = $describes ? cbxsf_rm_meta_description() : '';
+				if ( '' !== $fallback ) {
+					$node[ $k ] = $fallback;
+				} else {
+					unset( $node[ $k ] );
+				}
+			}
+			continue;
+		}
+		if ( ! is_array( $v ) ) {
+			continue;
+		}
+		$slot = in_array( $k, array( 'employee', 'performer', 'author' ), true );                             // (g)
+		if ( $v && cbxsf_rm_is_list( $v ) ) {
+			$kept = array();
+			foreach ( $v as $x ) {
+				if ( ! cbxsf_rm_drop( $x, $slot ) ) {
+					$kept[] = $x;
+				}
+			}
+			if ( count( $kept ) !== count( $v ) ) {
+				if ( ! $kept ) {
+					unset( $node[ $k ] ); // now empty: drop the property
+					continue;
+				}
+				$v = $kept;
+			}
+		} elseif ( cbxsf_rm_drop( $v, $slot ) ) {
+			unset( $node[ $k ] );
+			continue;
+		}
+		$node[ $k ] = cbxsf_rm_clean( $v, $ctx );
+	}
+	return $node;
+}
+function cbxsf_rm_nodes( $data, $jsonld = null ) {
+	if ( ! is_array( $data ) || ! cbxsf_fix_active( 'rm_nodes' ) ) {
+		return $data;
+	}
+	// (g) An Article credited to the agency on a non-blog singular page (symptoms): the page's own node stays.
+	if ( is_singular() && 'post' !== get_post_type( get_queried_object_id() ) ) {
+		foreach ( $data as $k => $node ) {
+			if ( ! array_intersect( cbxsf_rm_type_list( $node ), array( 'Article', 'BlogPosting', 'NewsArticle' ) ) || empty( $node['author'] ) || ! is_array( $node['author'] ) ) {
+				continue;
+			}
+			$authors = cbxsf_rm_is_list( $node['author'] ) ? $node['author'] : array( $node['author'] );
+			if ( count( array_filter( $authors, 'cbxsf_rm_is_agency' ) ) === count( $authors ) ) {
+				unset( $data[ $k ] );
+			}
+		}
+	}
+	// (g) A standalone top-level agency Person node.
+	foreach ( $data as $k => $node ) {
+		if ( in_array( 'Person', cbxsf_rm_type_list( $node ), true ) && cbxsf_rm_is_agency( $node ) ) {
+			unset( $data[ $k ] );
+		}
+	}
+	$ctx = array( 'ids' => array(), 'renamed' => array() );
+	cbxsf_rm_collect_ids( $data, $ctx['ids'] );
+	$data = cbxsf_rm_clean( $data, $ctx );
+	// (b) Re-point bare references to a renamed id, unless another node (the WebPage) still carries the old id.
+	if ( $ctx['renamed'] ) {
+		$live = array();
+		cbxsf_rm_collect_ids( $data, $live );
+		$map = array();
+		foreach ( $ctx['renamed'] as $old => $new ) {
+			if ( empty( $live[ $old ] ) ) {
+				$map[ $old ] = $new;
+			}
+		}
+		if ( $map ) {
+			$data = cbxsf_rm_remap_refs( $data, $map );
+		}
+	}
+	return $data;
+}
+/**
+ * (e), second half: Rank Math prints the graph through wp_kses_post_deep(), AFTER every json_ld filter, and kses turns each
+ * bare '&' back into '&amp;'. Inside <script type="application/ld+json"> entities are not decoded, so Google reads
+ * 'Pravo Wellness &amp; Associates' however the name was stored. Rank Math echoes the script on rank_math/head at 90:
+ * buffer 89..91 and turn '&amp;' back into '&' inside Rank Math's own ld+json script only (everything else in the buffer
+ * is echoed unchanged). If the buffer stack is not ours at 91 we leave it alone; PHP flushes it at shutdown.
+ */
+function cbxsf_rm_head_open() {
+	if ( cbxsf_fix_active( 'rm_nodes' ) ) {
+		ob_start();
+		$GLOBALS['cbxsf_rm_ob_level'] = ob_get_level();
+	}
+}
+function cbxsf_rm_head_close() {
+	if ( empty( $GLOBALS['cbxsf_rm_ob_level'] ) ) {
+		return;
+	}
+	$level = $GLOBALS['cbxsf_rm_ob_level'];
+	unset( $GLOBALS['cbxsf_rm_ob_level'] );
+	if ( ob_get_level() !== $level ) {
+		return;
+	}
+	$html = ob_get_clean();
+	$out  = preg_replace_callback(
+		'#(<script type="application/ld\+json" class="rank-math-schema[^"]*">)(.*?)(</script>)#s',
+		function ( $m ) {
+			return $m[1] . str_replace( '&amp;', '&', $m[2] ) . $m[3];
+		},
+		$html
+	);
+	echo null === $out ? $html : $out; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- Rank Math's own, already escaped output
+}
+if ( cbxsf_optin( 'rm_nodes' ) ) {
+	add_filter( 'rank_math/json_ld', 'cbxsf_rm_nodes', 99999, 2 );
+	add_action( 'rank_math/head', 'cbxsf_rm_head_open', 89 );
+	add_action( 'rank_math/head', 'cbxsf_rm_head_close', 91 );
+	add_filter(
+		'rank_math/opengraph/slack_enhanced_data',
+		function ( $data ) {
+			if ( ! is_array( $data ) || ! cbxsf_fix_active( 'rm_nodes' ) ) {
+				return $data;
+			}
+			foreach ( $data as $label => $value ) {
+				if ( is_string( $value ) && 0 === strcasecmp( trim( $value ), 'BASIX' ) ) {
+					unset( $data[ $label ] ); // twitter:label/data 'Written by' => 'BASIX'
+				}
+			}
+			return $data;
+		},
+		99999
+	);
+}
+
+/**
+ * FIX #14 (key cache_guards) — WP Rocket cache-poisoning guards (speed.md section 5 FIX 1).
+ *
+ * One crawler hit (facebookexternalhit/WhatsApp, which WP Rocket serves uncached-and-unoptimised) or one ad click with a
+ * click-id parameter WP Rocket does not ignore (ttclid ...) caches the unoptimised page (~40 blocking stylesheets) for
+ * every visitor for the whole page-cache TTL (1 day now). Same list as calhounspineca csc-speed-fixes.php FIX 1;
+ * exact case 'ScCid'; PHP_INT_MAX.
+ *
+ * IMPORTANT: WP Rocket reads cache_reject_ua and cache_ignored_parameters from its per-domain config file
+ * (wp-content/wp-rocket-config/<host>.php), which only rocket_generate_config_file() writes. These filters change
+ * nothing on an install until that function runs there after the key is enabled (calhounspineca had the filter for
+ * weeks with an old config file: inert). The rollout must regenerate it per site: cbxsf_regen_rocket_config() below
+ * (dry run first: it lists the config variables that would change; expect only rocket_cache_reject_ua and
+ * rocket_cache_ignored_parameters). Verify by the config file, not by this source.
+ */
+if ( cbxsf_optin( 'cache_guards' ) ) {
+	add_filter(
+		'rocket_cache_reject_ua',
+		function ( $ua ) {
+			if ( ! cbxsf_fix_active( 'cache_guards' ) ) {
+				return $ua;
+			}
+			return array_values( array_diff( (array) $ua, array( 'facebookexternalhit', 'WhatsApp' ) ) );
+		},
+		PHP_INT_MAX
+	);
+	add_filter(
+		'rocket_cache_ignored_parameters',
+		function ( $params ) {
+			if ( ! cbxsf_fix_active( 'cache_guards' ) ) {
+				return $params;
+			}
+			$params = (array) $params;
+			foreach ( array( 'ttclid', 'twclid', 'li_fat_id', 'igshid', 'yclid', 'dclid', 'rdt_cid', 'ScCid', '_hsenc', '_hsmi', 'hsa_acc', 'hsa_cam',
+				'hsa_grp', 'hsa_ad', 'hsa_src', 'hsa_tgt', 'hsa_kw', 'hsa_mt', 'hsa_net', 'hsa_ver', 'mkt_tok', 'msclkid', 'epik', 'ttc' ) as $k ) {
+				$params[ $k ] = 1;
+			}
+			return $params;
+		},
+		PHP_INT_MAX
+	);
+}
+
+/**
+ * For rollout scripts (never called by the plugin itself). Regenerates WP Rocket's per-domain config file so the
+ * FIX #14 guards (or any other config-level filter) take effect, ONLY when WP Rocket is active and
+ * rocket_generate_config_file() exists. $dry_run = true writes nothing and lists, per config file, the `$rocket_*`
+ * variables whose value would change. Returns array( 'status' => ..., 'changed' => array( file => array( var ... ) ) ).
+ */
+function cbxsf_regen_rocket_config( $dry_run = false ) {
+	if ( ! defined( 'WP_ROCKET_VERSION' ) || ! function_exists( 'rocket_generate_config_file' ) ) {
+		return array( 'status' => 'skipped: WP Rocket not active', 'changed' => array() );
+	}
+	$changed = array();
+	if ( function_exists( 'get_rocket_config_file' ) ) {
+		$vars = function ( $php ) {
+			preg_match_all( '/^\$(rocket_\w+)\s*=\s*(.*?);\s*$/ms', (string) $php, $m ); // arrays span lines
+			return array_combine( $m[1], $m[2] );
+		};
+		list( $files, $buffer ) = get_rocket_config_file();
+		$new = $vars( $buffer );
+		foreach ( (array) $files as $file ) {
+			$old = is_readable( $file ) ? $vars( file_get_contents( $file ) ) : array(); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_get_contents_file_get_contents
+			foreach ( array_unique( array_merge( array_keys( $old ), array_keys( $new ) ) ) as $var ) {
+				if ( ( isset( $old[ $var ] ) ? $old[ $var ] : null ) !== ( isset( $new[ $var ] ) ? $new[ $var ] : null ) ) {
+					$changed[ basename( $file ) ][] = $var;
+				}
+			}
+		}
+	}
+	if ( $dry_run ) {
+		return array( 'status' => 'dry run: nothing written', 'changed' => $changed );
+	}
+	rocket_generate_config_file();
+	return array( 'status' => 'regenerated', 'changed' => $changed );
+}
+
+/**
+ * FIX #15 (key lrc_off) — WP Rocket Lazy Render Content off (speed.md section 7).
+ *
+ * content-visibility:auto with no intrinsic size collapses below-the-fold sections; on 4 main service pages it sits on
+ * the whole page wrapper and the footer jumps (desktop CLS 0.82 to 1.04). Same switch as the SEO templates'
+ * disable_lazy_render (redundant where one runs). The wpr_lazy_render_content table is left alone.
+ */
+if ( cbxsf_optin( 'lrc_off' ) ) {
+	add_filter(
+		'rocket_lrc_optimization',
+		function ( $enabled ) {
+			return cbxsf_fix_active( 'lrc_off' ) ? false : $enabled;
+		}
+	);
+}
+/* cbxsf-optin-end ===================================================================================== */
 
 /**
  * GitHub auto-updater (mirrors the other CHIROBASIX plugins).
