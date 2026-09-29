@@ -652,10 +652,11 @@ add_filter(
  *   Keys:    acf_titles (FIX #12), rm_nodes (FIX #13), cache_guards (FIX #14), lrc_off (FIX #15)
  *   Enable:  wp option update cbxsf_optin '["rm_nodes","acf_titles"]' --format=json --autoload=yes
  *   Undo:    remove the key from the array (or delete the option), then purge. cache_guards also needs
- *            cbxsf_regen_rocket_config() again, because WP Rocket keeps the old values in its config file.
+ *            cbxsf_regen_rocket_config() again (in a NEW process), because WP Rocket keeps the old values in its
+ *            config file.
  *   Veto:    add_filter( 'cbxsf_fix_<key>', '__return_false' ) in a site mu-plugin or the theme (checked when the
- *            fix runs). The names used in the 9/28 findings also work: cbxsf_fix_title_shortcodes,
- *            cbxsf_rm_node_cleanup, cbxsf_cache_guards, cbxsf_disable_lazy_render.
+ *            fix runs; a cache_guards veto only in a mu-plugin, see FIX #14). The names used in the 9/28 findings
+ *            also work: cbxsf_fix_title_shortcodes, cbxsf_rm_node_cleanup, cbxsf_cache_guards, cbxsf_disable_lazy_render.
  */
 
 /** True only when option `cbxsf_optin` is an array that lists $key. */
@@ -688,50 +689,72 @@ function cbxsf_fix_active( $key ) {
  * template system: never edited). Yoast and Rank Math build <title>, og:title, twitter:title, og:image:alt and the
  * Yoast WebPage name from that raw title (70 sites). On Rank Math sites Image SEO also writes it into every image's
  * alt= and title= (img_alt_format '%title%'), 38 to 54 times per page, on the_content at priority 11.
- * Strings containing '[acf' get do_shortcode + wp_strip_all_tags, whitespace trimmed and collapsed (bullchiro's
- * Company Info city starts with a space). Images: only on a post whose post_title contains '[acf', and only inside
- * alt= / title= attribute values. Anything without '[acf' passes through byte-for-byte.
+ *
+ * Trust: only the queried post's OWN title is trusted. SEO strings are resolved only on a singular, non-search request,
+ * and only the '[acf ...]' shortcodes that appear in that post's post_title are run, each token alone through
+ * do_shortcode (never the whole string), then tags stripped and whitespace trimmed/collapsed (bullchiro's Company Info
+ * city starts with a space). A visitor's search phrase ('/?s=[acf ...]', which the search-results title templates
+ * echo), any other '[acf ...]' and any other shortcode are left exactly as they were. Images: only inside alt= /
+ * title= attribute values, only tokens from that post's own title. Anything without such a token passes through
+ * byte-for-byte. rank_math/frontend/title also runs at 19, before the per-site cbx-seo-fixes template's 65-character
+ * suffix rule at 20 (which would otherwise measure the raw shortcode).
  */
-function cbxsf_resolve_acf( $s ) {
-	if ( ! is_string( $s ) || false === strpos( $s, '[acf' ) ) {
+function cbxsf_acf_tokens( $post ) {
+	$post = $post ? get_post( $post ) : null;
+	if ( ! $post || false === strpos( (string) $post->post_title, '[acf' ) ) {
+		return array();
+	}
+	preg_match_all( '/\[acf(?=[\s\]])[^\[\]]*\]/', html_entity_decode( (string) $post->post_title, ENT_QUOTES | ENT_HTML5, 'UTF-8' ), $m );
+	return array_values( array_unique( $m[0] ) );
+}
+function cbxsf_resolve_acf( $s, $allowed ) {
+	if ( ! is_string( $s ) || false === strpos( $s, '[acf' ) || ! $allowed ) {
 		return $s;
 	}
-	// Quotes inside the shortcode may arrive entity-encoded; decode them inside the shortcode only, so it parses.
-	$d = preg_replace_callback(
-		'/\[acf\b[^\]]*\]/',
-		function ( $m ) {
-			return html_entity_decode( $m[0], ENT_QUOTES | ENT_HTML5, 'UTF-8' );
+	$hit = false;
+	$r   = preg_replace_callback(
+		'/\[acf(?=[\s\]])[^\[\]]*\]/',
+		function ( $m ) use ( $allowed, &$hit ) {
+			// Quotes inside the shortcode may arrive entity-encoded; decode this token only, so it parses.
+			$tok = html_entity_decode( $m[0], ENT_QUOTES | ENT_HTML5, 'UTF-8' );
+			if ( ! in_array( $tok, $allowed, true ) ) {
+				return $m[0];
+			}
+			$hit = true;
+			return wp_strip_all_tags( do_shortcode( $tok ) );
 		},
 		$s
 	);
-	$r = preg_replace( '/\s+/u', ' ', wp_strip_all_tags( do_shortcode( null === $d ? $s : $d ) ) );
+	if ( null === $r || ! $hit ) {
+		return $s;
+	}
+	$r = preg_replace( '/\s+/u', ' ', $r );
 	return null === $r ? $s : trim( $r ); // a regex failure (invalid UTF-8) leaves the string as it was
 }
 function cbxsf_acf_title( $s ) {
-	if ( ! is_string( $s ) || false === strpos( $s, '[acf' ) || ! cbxsf_fix_active( 'acf_titles' ) ) {
+	if ( ! is_string( $s ) || false === strpos( $s, '[acf' ) || ! is_singular() || is_search() || ! cbxsf_fix_active( 'acf_titles' ) ) {
 		return $s;
 	}
-	return cbxsf_resolve_acf( $s );
+	$id = get_queried_object_id();
+	return $id ? cbxsf_resolve_acf( $s, cbxsf_acf_tokens( $id ) ) : $s;
 }
 function cbxsf_acf_img_attrs( $html, $post_id = null ) {
 	if ( ! is_string( $html ) || false === strpos( $html, 'acf' ) ) {
 		return $html;
 	}
-	$post = get_post( $post_id );
-	if ( ! $post || false === strpos( (string) $post->post_title, '[acf' ) || ! cbxsf_fix_active( 'acf_titles' ) ) {
+	$allowed = cbxsf_acf_tokens( null === $post_id ? get_post() : $post_id );
+	if ( ! $allowed || ! cbxsf_fix_active( 'acf_titles' ) ) {
 		return $html;
 	}
 	$out = preg_replace_callback(
-		'/<[a-zA-Z][^>]*\s(?:alt|title)\s*=[^>]*>/',
-		function ( $tag ) {
+		'/<[a-zA-Z][^>]*\s(?:alt|title)\s*=[^>]*>/i',
+		function ( $tag ) use ( $allowed ) {
 			$t = preg_replace_callback(
 				'/(\s(?:alt|title)\s*=\s*)(?:"([^"]*)"|\'([^\']*)\')/i',
-				function ( $m ) {
+				function ( $m ) use ( $allowed ) {
 					$val = html_entity_decode( isset( $m[3] ) ? $m[3] : $m[2], ENT_QUOTES | ENT_HTML5, 'UTF-8' );
-					if ( false === strpos( $val, '[acf' ) ) {
-						return $m[0];
-					}
-					return $m[1] . '"' . esc_attr( cbxsf_resolve_acf( $val ) ) . '"';
+					$new = cbxsf_resolve_acf( $val, $allowed );
+					return $new === $val ? $m[0] : $m[1] . '"' . esc_attr( $new ) . '"';
 				},
 				$tag[0]
 			);
@@ -745,6 +768,7 @@ if ( cbxsf_optin( 'acf_titles' ) ) {
 	foreach ( array( 'wpseo_title', 'wpseo_opengraph_title', 'wpseo_twitter_title', 'rank_math/frontend/title', 'rank_math/opengraph/facebook/og_title', 'rank_math/opengraph/twitter/twitter_title', 'rank_math/opengraph/facebook/og_image_alt' ) as $cbxsf_hook ) {
 		add_filter( $cbxsf_hook, 'cbxsf_acf_title', 99999 );
 	}
+	add_filter( 'rank_math/frontend/title', 'cbxsf_acf_title', 19 ); // before the per-site template's suffix rule (20)
 	add_filter(
 		'wpseo_schema_webpage',
 		function ( $piece ) {
@@ -771,10 +795,14 @@ if ( cbxsf_optin( 'acf_titles' ) ) {
  *      AboutPage/ContactPage on #webpage). A bare {"@id"} reference is re-pointed only when no other node still holds
  *      the old id (otherwise it points at the WebPage and stays).
  *  (c) procedure/service named 'Top|Premium|Experienced Chiropractor' (optionally ' in <town>') -> 'Chiropractic Care'.
- *  (d) an Offer with no price is dropped ('New Patient Special' with a relative url and no price).
- *  (e) every `name` string is entity-decoded, and '&amp;' in Rank Math's printed ld+json becomes '&' again (literal
- *      '&amp;' on brickrosechiro, alphaspine810, palmharbor743, pravowelln632: see cbxsf_rm_head_close()).
- *  (f) a description with a blank token (starts ' is proud' / space + lowercase, or has 'in , ', 'at , ', 'in .') is
+ *  (d) an Offer with no price is dropped from the `offers` of those three types, or of an untyped node (castlehills'
+ *      Services template prints the procedure node without @type): 'New Patient Special', relative url, no price.
+ *      Offers anywhere else (makesOffer, hasOfferCatalog, a Product's offers) are left alone.
+ *  (e) every `name` string is entity-decoded ('<' and '>' stay encoded, so kses never truncates a name and nothing can
+ *      close the script tag), and '&amp;' in Rank Math's printed ld+json becomes '&' again (literal '&amp;' on
+ *      brickrosechiro, alphaspine810, palmharbor743, pravowelln632: see cbxsf_rm_head_close()). That print pass covers
+ *      every string in Rank Math's script, because kses turns every '&' into '&amp;' (URLs such as hasMap included).
+ *  (f) a description with a blank token (starts ' is proud' / spaces + lowercase, or has 'in , ', 'at , ', 'in .') is
  *      replaced by the page's Rank Math meta description when that is clean, else removed. The fallback is used only
  *      on nodes that describe the page (service types, MedicalCondition, Article, WebPage types); other nodes (a
  *      Person, the business) just lose the broken description.
@@ -782,8 +810,8 @@ if ( cbxsf_optin( 'acf_titles' ) ) {
  *      employee / performer / author (empty lists dropped), a top-level BASIX Person node is removed, and an Article
  *      credited to it on a non-blog singular page (symptom pages) is removed. Slack preview: the 'Written by BASIX' row.
  *  (h) `gender` removed from every Person (unchecked profile field; female doctors printed 'Male'). No usermeta writes.
- *  (i) MedicalCondition code / signOrSymptom / riskFactor / differentialDiagnosis removed only when, after trimming a
- *      trailing comma, the value is empty, ',', '[]' or not valid JSON. Populated values stay word for word.
+ *  (i) MedicalCondition code / signOrSymptom / riskFactor / differentialDiagnosis removed only when, after trimming
+ *      trailing commas, the value is empty, ',', '[]' or not valid JSON. Valid populated lists stay word for word.
  * Idempotent with the per-site template (it strips performer/usedToTreat on top-level nodes at 999; this finds none left).
  */
 function cbxsf_rm_type_list( $node ) {
@@ -841,9 +869,9 @@ function cbxsf_rm_is_priceless_offer( $v ) {
 	}
 	return empty( $v['priceSpecification'] );
 }
-/** (d) a priceless Offer anywhere; (g) the agency Person in an employee / performer / author slot. */
-function cbxsf_rm_drop( $x, $agency_slot ) {
-	return cbxsf_rm_is_priceless_offer( $x ) || ( $agency_slot && cbxsf_rm_is_agency( $x ) );
+/** (d) a priceless Offer in a service (or untyped) node's `offers`; (g) the agency Person in an employee / performer / author slot. */
+function cbxsf_rm_drop( $x, $agency_slot, $offer_slot = false ) {
+	return ( $offer_slot && cbxsf_rm_is_priceless_offer( $x ) ) || ( $agency_slot && cbxsf_rm_is_agency( $x ) );
 }
 function cbxsf_rm_decode( $s ) {
 	for ( $i = 0; $i < 3 && false !== strpos( $s, '&' ); $i++ ) {
@@ -853,13 +881,14 @@ function cbxsf_rm_decode( $s ) {
 		}
 		$s = $d;
 	}
-	return $s;
+	// '<' and '>' stay encoded: kses (at print) would cut a name at a bare '<', and no decoded name may ever end the script.
+	return str_replace( array( '<', '>' ), array( '&lt;', '&gt;' ), $s );
 }
 function cbxsf_rm_blank_desc( $s ) {
 	return is_string( $s ) && (
-		preg_match( '/^\s+\p{Ll}/u', $s )                  // ' is proud to offer ...': the name at the start is blank
+		preg_match( '/^\h+\p{Ll}/u', $s )                  // ' is proud to offer ...': the name at the start is blank
 		|| preg_match( '/^\s*is proud\b/i', $s )
-		|| preg_match( '/\b(?:in|at)\s+[,.](?=\s|$)/i', $s ) // 'At , we focus', 'in , TN', 'office in .'
+		|| preg_match( '/\b(?:in|at)\h+[,.](?=\s|$)/i', $s ) // 'At , we focus', 'in , TN', 'office in .' (x-ray pages)
 	);
 }
 function cbxsf_rm_meta_description() {
@@ -881,7 +910,7 @@ function cbxsf_rm_junk_list( $v ) {
 	if ( ! is_string( $v ) ) {
 		return false;
 	}
-	$s = trim( (string) preg_replace( '/,\s*$/', '', trim( $v ) ) );
+	$s = trim( (string) preg_replace( '/[\s,]+$/', '', trim( $v ) ) );
 	if ( '' === $s || ',' === $s || '[]' === $s ) {
 		return true;
 	}
@@ -970,11 +999,12 @@ function cbxsf_rm_clean( $node, &$ctx ) {
 		if ( ! is_array( $v ) ) {
 			continue;
 		}
-		$slot = in_array( $k, array( 'employee', 'performer', 'author' ), true );                             // (g)
+		$slot   = in_array( $k, array( 'employee', 'performer', 'author' ), true );                           // (g)
+		$offers = 'offers' === $k && ( $is_svc || ! $types );                                                    // (d)
 		if ( $v && cbxsf_rm_is_list( $v ) ) {
 			$kept = array();
 			foreach ( $v as $x ) {
-				if ( ! cbxsf_rm_drop( $x, $slot ) ) {
+				if ( ! cbxsf_rm_drop( $x, $slot, $offers ) ) {
 					$kept[] = $x;
 				}
 			}
@@ -985,7 +1015,7 @@ function cbxsf_rm_clean( $node, &$ctx ) {
 				}
 				$v = $kept;
 			}
-		} elseif ( cbxsf_rm_drop( $v, $slot ) ) {
+		} elseif ( cbxsf_rm_drop( $v, $slot, $offers ) ) {
 			unset( $node[ $k ] );
 			continue;
 		}
@@ -1042,8 +1072,7 @@ function cbxsf_rm_nodes( $data, $jsonld = null ) {
  * is echoed unchanged). If the buffer stack is not ours at 91 we leave it alone; PHP flushes it at shutdown.
  */
 function cbxsf_rm_head_open() {
-	if ( cbxsf_fix_active( 'rm_nodes' ) ) {
-		ob_start();
+	if ( cbxsf_fix_active( 'rm_nodes' ) && ob_start() ) { // record a level only for a buffer that really opened
 		$GLOBALS['cbxsf_rm_ob_level'] = ob_get_level();
 	}
 }
@@ -1101,45 +1130,57 @@ if ( cbxsf_optin( 'rm_nodes' ) ) {
  * weeks with an old config file: inert). The rollout must regenerate it per site: cbxsf_regen_rocket_config() below
  * (dry run first: it lists the config variables that would change; expect only rocket_cache_reject_ua and
  * rocket_cache_ignored_parameters). Verify by the config file, not by this source.
+ *
+ * The filters are registered when the plugin loads, so the option must list 'cache_guards' BEFORE the process that
+ * regenerates starts: write the option in one command, regenerate in the next (the helper refuses when the option and
+ * the registered filters disagree). A site veto of cache_guards belongs in a mu-plugin, not the theme: the rollout's
+ * WP-CLI runs skip the theme, so a theme veto would be ignored there but honoured when WP Rocket regenerates from
+ * wp-admin, and the two config files would differ.
  */
+function cbxsf_cache_guard_ua( $ua ) {
+	if ( ! cbxsf_fix_active( 'cache_guards' ) ) {
+		return $ua;
+	}
+	return array_values( array_diff( (array) $ua, array( 'facebookexternalhit', 'WhatsApp' ) ) );
+}
+function cbxsf_cache_guard_params( $params ) {
+	if ( ! cbxsf_fix_active( 'cache_guards' ) ) {
+		return $params;
+	}
+	$params = (array) $params;
+	foreach ( array( 'ttclid', 'twclid', 'li_fat_id', 'igshid', 'yclid', 'dclid', 'rdt_cid', 'ScCid', '_hsenc', '_hsmi', 'hsa_acc', 'hsa_cam',
+		'hsa_grp', 'hsa_ad', 'hsa_src', 'hsa_tgt', 'hsa_kw', 'hsa_mt', 'hsa_net', 'hsa_ver', 'mkt_tok', 'msclkid', 'epik', 'ttc' ) as $k ) {
+		$params[ $k ] = 1;
+	}
+	return $params;
+}
 if ( cbxsf_optin( 'cache_guards' ) ) {
-	add_filter(
-		'rocket_cache_reject_ua',
-		function ( $ua ) {
-			if ( ! cbxsf_fix_active( 'cache_guards' ) ) {
-				return $ua;
-			}
-			return array_values( array_diff( (array) $ua, array( 'facebookexternalhit', 'WhatsApp' ) ) );
-		},
-		PHP_INT_MAX
-	);
-	add_filter(
-		'rocket_cache_ignored_parameters',
-		function ( $params ) {
-			if ( ! cbxsf_fix_active( 'cache_guards' ) ) {
-				return $params;
-			}
-			$params = (array) $params;
-			foreach ( array( 'ttclid', 'twclid', 'li_fat_id', 'igshid', 'yclid', 'dclid', 'rdt_cid', 'ScCid', '_hsenc', '_hsmi', 'hsa_acc', 'hsa_cam',
-				'hsa_grp', 'hsa_ad', 'hsa_src', 'hsa_tgt', 'hsa_kw', 'hsa_mt', 'hsa_net', 'hsa_ver', 'mkt_tok', 'msclkid', 'epik', 'ttc' ) as $k ) {
-				$params[ $k ] = 1;
-			}
-			return $params;
-		},
-		PHP_INT_MAX
-	);
+	add_filter( 'rocket_cache_reject_ua', 'cbxsf_cache_guard_ua', PHP_INT_MAX );
+	add_filter( 'rocket_cache_ignored_parameters', 'cbxsf_cache_guard_params', PHP_INT_MAX );
 }
 
 /**
  * For rollout scripts (never called by the plugin itself). Regenerates WP Rocket's per-domain config file so the
  * FIX #14 guards (or any other config-level filter) take effect, ONLY when WP Rocket is active and
  * rocket_generate_config_file() exists. $dry_run = true writes nothing and lists, per config file, the `$rocket_*`
- * variables whose value would change. Returns array( 'status' => ..., 'changed' => array( file => array( var ... ) ) ).
+ * variables whose value would change. Returns array( 'status' => ..., 'guards' => bool, 'changed' => array( file => array( var ... ) ) ).
+ * Refuses (status 'error: ...', nothing written) when option cbxsf_optin and the FIX #14 filters registered in this
+ * process disagree, e.g. the option was written earlier in the same process: run it again in a new process.
  */
 function cbxsf_regen_rocket_config( $dry_run = false ) {
 	if ( ! defined( 'WP_ROCKET_VERSION' ) || ! function_exists( 'rocket_generate_config_file' ) ) {
-		return array( 'status' => 'skipped: WP Rocket not active', 'changed' => array() );
+		return array( 'status' => 'skipped: WP Rocket not active', 'guards' => false, 'changed' => array() );
 	}
+	$listed     = cbxsf_optin( 'cache_guards' );
+	$registered = false !== has_filter( 'rocket_cache_reject_ua', 'cbxsf_cache_guard_ua' );
+	if ( $listed !== $registered ) {
+		return array(
+			'status'  => 'error: cbxsf_optin ' . ( $listed ? 'lists' : 'does not list' ) . ' cache_guards but its filters are ' . ( $registered ? '' : 'not ' ) . 'registered in this process; nothing written, run again in a new process',
+			'guards'  => false,
+			'changed' => array(),
+		);
+	}
+	$guards  = $listed && cbxsf_fix_active( 'cache_guards' );
 	$changed = array();
 	if ( function_exists( 'get_rocket_config_file' ) ) {
 		$vars = function ( $php ) {
@@ -1158,10 +1199,10 @@ function cbxsf_regen_rocket_config( $dry_run = false ) {
 		}
 	}
 	if ( $dry_run ) {
-		return array( 'status' => 'dry run: nothing written', 'changed' => $changed );
+		return array( 'status' => 'dry run: nothing written', 'guards' => $guards, 'changed' => $changed );
 	}
 	rocket_generate_config_file();
-	return array( 'status' => 'regenerated', 'changed' => $changed );
+	return array( 'status' => 'regenerated', 'guards' => $guards, 'changed' => $changed );
 }
 
 /**
