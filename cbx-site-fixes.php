@@ -477,13 +477,15 @@ add_filter(
  * Template page titles contain ACF shortcodes. Themes run them through the_title, so the page looks right, but
  * Yoast builds each breadcrumb (and the BreadcrumbList Google reads) from the raw title. This runs the shortcode on
  * each crumb, then strips tags. Crumbs without a '[' are untouched. Found on 72 of 100 Yoast sites (9/28).
+ * Never on search results (1.10.0): the search crumb is the visitor's own query ('You searched for [acf ...]'), and
+ * /?s=[acf field=city post_id=options] used to print the Company Info city there. No other crumb exists on that page.
  *
  * Per-site off: add_filter( 'cbxsf_fix_breadcrumb_shortcodes', '__return_false' );
  */
 add_filter(
 	'wpseo_breadcrumb_links',
 	function ( $links ) {
-		if ( ! is_array( $links ) || ! apply_filters( 'cbxsf_fix_breadcrumb_shortcodes', true ) ) {
+		if ( ! is_array( $links ) || is_search() || ! apply_filters( 'cbxsf_fix_breadcrumb_shortcodes', true ) ) {
 			return $links;
 		}
 		foreach ( $links as $i => $link ) {
@@ -500,12 +502,13 @@ add_filter(
  * FIX #9b — Schema Pro prints its own BreadcrumbList (next to Yoast's) from the same raw titles, so Google still
  * read 'Top Chiropractor in [acf field="city" ...]' on 18 Schema Pro sites after FIX #9. Same treatment here.
  * Schema Pro caches its output in post meta 'wp_schema_pro_optimized_structured_data': clear it after updating.
+ * Never on search results (1.10.0), as FIX #9.
  * Per-site off: the same 'cbxsf_fix_breadcrumb_shortcodes' filter.
  */
 add_filter(
 	'wp_schema_pro_global_schema_breadcrumb',
 	function ( $schema ) {
-		if ( ! is_array( $schema ) || empty( $schema['itemListElement'] ) || ! apply_filters( 'cbxsf_fix_breadcrumb_shortcodes', true ) ) {
+		if ( ! is_array( $schema ) || empty( $schema['itemListElement'] ) || is_search() || ! apply_filters( 'cbxsf_fix_breadcrumb_shortcodes', true ) ) {
 			return $schema;
 		}
 		foreach ( $schema['itemListElement'] as $i => $item ) {

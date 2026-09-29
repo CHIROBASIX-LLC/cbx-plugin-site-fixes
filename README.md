@@ -45,6 +45,9 @@ Put a `cache_guards` veto in a mu-plugin: rollout WP-CLI runs skip the theme, so
   only when a required exclusion is really missing (a duplicate entry no longer triggers a rewrite, config regeneration
   and full cache clear; and a missing entry that 1.9.1 skipped because a duplicate hid it from its count is now added,
   with one config regeneration and cache clear on that install: 0 such installs in the 9/29 fleet probe).
+  Always-on change (security): FIX #9 / #9b no longer run shortcodes in breadcrumbs on search-result pages, where the
+  search crumb is the visitor's own query (`/?s=[acf field=city post_id=options]` printed the Company Info city).
+  This is the only output change with `cbxsf_optin` absent, and only on search pages whose query contains `[`.
   **Release note:** the 29 installs still on 1.6.0/1.7.0 also receive the always-on FIX #8 to #11 from 1.8.0/1.9.x on
   this update, including FIX #11 (noindex on Elementor `e-landing-page` posts). Several are not clinics (wmsprinkling,
   cdgage, tffj, houstonremodel, practicebroker, morganproserv, houstonac1, winchelirri, navigatorins, szymanskilaw,
