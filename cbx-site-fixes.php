@@ -2,8 +2,8 @@
 /**
  * Plugin Name: CHIROBASIX Site Fixes
  * Plugin URI:  https://chirobasix.com
- * Description: Agency-wide compatibility fixes for CHIROBASIX client sites. (1) Keeps HighLevel booking calendars/forms and similar embeds out of WP Rocket LazyLoad (filter + saved option) so they render at full height. (2) Collapses RankMath's dual-typed Organization/LocalBusiness schema node to its LocalBusiness subtype so priceRange/openingHours validate (fixes SEMRush "property not recognized by Organization") + strips RankMath's malformed address-less potentialAction org-stub on symptom/service pages (fixes SEMRush "LocalBusiness address required") + derives thumbnailUrl for YouTube VideoObjects missing it (fixes SEMRush "thumbnailUrl required"). (3) Opt-in fixes (1.10.0+), OFF unless the site lists the fix in option cbxsf_optin: [acf] shortcodes in SEO titles, Rank Math service/symptom schema clean-up, WP Rocket cache-poisoning guards, WP Rocket Lazy Render off. Auto-updates from GitHub.
- * Version:     1.10.0
+ * Description: Agency-wide compatibility fixes for CHIROBASIX client sites. (1) Keeps HighLevel booking calendars/forms and similar embeds out of WP Rocket LazyLoad (filter + saved option) so they render at full height. (2) Collapses RankMath's dual-typed Organization/LocalBusiness schema node to its LocalBusiness subtype so priceRange/openingHours validate (fixes SEMRush "property not recognized by Organization") + strips RankMath's malformed address-less potentialAction org-stub on symptom/service pages (fixes SEMRush "LocalBusiness address required") + derives thumbnailUrl for YouTube VideoObjects missing it (fixes SEMRush "thumbnailUrl required"). (3) Opt-in fixes (1.10.0+), OFF unless the site lists the fix in option cbxsf_optin: [acf] shortcodes in SEO titles, Rank Math service/symptom schema clean-up, WP Rocket cache-poisoning guards, WP Rocket Lazy Render off; (1.11.0+) Yoast '?p=ID' permalink repair, sitemap archive links decided from redirect rules, agency 'BASIX' author out of Yoast data, 'Dr. Dr.' on author pages, 404 for /page/N/ on the homepage. Auto-updates from GitHub.
+ * Version:     1.11.0
  * Author:      CHIROBASIX
  * Author URI:  https://chirobasix.com
  * License:     GPL-2.0+
@@ -14,7 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'CBXSF_VERSION', '1.10.0' );
+define( 'CBXSF_VERSION', '1.11.0' );
 
 /**
  * The embed hosts that must never be lazy-loaded or delayed (they self-resize via postMessage
@@ -529,11 +529,15 @@ add_filter(
  *     sitemap; each one 302s to the homepage. They are never pages: excluded.
  * (b) Template post-type archives (/services/, /symptoms/ ...) 301 to the homepage on most sites but stay in the
  *     sitemap. The archive link is dropped only when the archive URL really answers with a redirect (checked with
- *     one HEAD request per post type, cached for a day; any error keeps the link).
+ *     one HEAD request per post type, cached for a day; any error keeps the link). With the opt-in key sitemap_rules
+ *     (1.11.0) the site's redirect rules decide first instead: FIX #17 below.
  *
  * Per-site off: add_filter( 'cbxsf_fix_sitemap_redirects', '__return_false' );
  */
 function cbxsf_archive_redirects( $post_type ) {
+	if ( cbxsf_fix_active( 'sitemap_rules' ) ) {
+		return cbxsf_archive_redirects_by_rule( $post_type ); // FIX #17 (opt-in)
+	}
 	$key  = 'cbxsf_arch_' . md5( $post_type );
 	$code = get_transient( $key );
 	if ( false === $code ) {
@@ -645,14 +649,18 @@ add_filter(
 );
 
 /* cbxsf-optin-begin ===================================================================================
- * OPT-IN FIXES (1.10.0+): FIX #12 to FIX #15.
+ * OPT-IN FIXES (1.10.0+): FIX #12 to FIX #20.
  *
  * This plugin auto-updates on every install, including set-aside and skipped ones, so every fix below is OFF
  * unless the site lists its key in the option `cbxsf_optin` (an array of keys, written by the rollout script on
- * the installs that should get it). With the option absent none of these hooks is registered and the plugin
- * behaves exactly like 1.9.1.
+ * the installs that should get it). With the option absent none of these hooks is registered: 1.10.0 behaved exactly
+ * like 1.9.1, and 1.11.0 behaves exactly like 1.10.0. Two inert exceptions in 1.11.0: FIX #10 asks
+ * cbxsf_fix_active( 'sitemap_rules' ) before its HEAD, and FIX #16's WP-Cron handler is always registered (it only
+ * runs if its own event exists, and then unschedules the event when the key is gone).
  *
- *   Keys:    acf_titles (FIX #12), rm_nodes (FIX #13), cache_guards (FIX #14), lrc_off (FIX #15)
+ *   Keys:    acf_titles (FIX #12), rm_nodes (FIX #13), cache_guards (FIX #14), lrc_off (FIX #15),
+ *            1.11.0: yoast_perma_sweep (FIX #16), sitemap_rules (FIX #17), yoast_agency_author (FIX #18),
+ *            drdr_author (FIX #19), paged_front_404 (FIX #20)
  *   Enable:  wp option update cbxsf_optin '["rm_nodes","acf_titles"]' --format=json --autoload=yes
  *   Undo:    remove the key from the array (or delete the option), then purge. cache_guards also needs
  *            cbxsf_regen_rocket_config() again (in a NEW process), because WP Rocket keeps the old values in its
@@ -1222,6 +1230,499 @@ if ( cbxsf_optin( 'lrc_off' ) ) {
 			return cbxsf_fix_active( 'lrc_off' ) ? false : $enabled;
 		}
 	);
+}
+
+/**
+ * FIX #16 (key yoast_perma_sweep) — Published blog posts whose Yoast data still says '?p=ID' (plan F5, prevention).
+ *
+ * Yoast builds a post's indexable while it is still scheduled, when its permalink is '?p=ID'. Its watcher rebuilds the row
+ * on publish (wp_insert_post at PHP_INT_MAX), but on cron-published batches it sometimes keeps '?p=ID': canonical, og:url
+ * and the schema @id then point at '?p=ID', which 301s back (1,008 posts on 15 Yoast sites 9/29, rebuilt by hand;
+ * swcmagnolia.com was still getting new ones).
+ *  (a) A post going future -> publish is noted on transition_post_status (99999) and repaired on wp_after_insert_post
+ *      (PHP_INT_MAX). transition_post_status fires BEFORE wp_insert_post, so a rebuild there would run before Yoast's own
+ *      watcher and could be overwritten by it; wp_after_insert_post fires after it, both in wp_publish_post (WP-Cron) and in
+ *      wp_insert_post. Any post type.
+ *  (b) A daily WP-Cron sweep (event 'cbxsf_yoast_perma_sweep'): published posts of type post whose row still holds '?p='
+ *      (joined on wp_posts.post_status, not on the row's own stale status; so no acf-field-group rows) are repaired, at
+ *      most 200 and 20 seconds per run. The event is scheduled on init only while the key is listed (and not vetoed),
+ *      Yoast is active and the site has pretty permalinks. When that stops being true the next run unschedules it: that
+ *      run handler is the one hook this fix registers without the key, and it does nothing unless the event exists.
+ * A repair happens only when the row holds '?p=' and get_permalink() does not. It uses Yoast's own builder
+ * (Indexable_Builder::build_for_id_and_type, class_exists + catch around every Yoast call), touches only
+ * wp_yoast_indexable (derived data), and clears that one URL from the WP Rocket cache (sweep only).
+ * Dry count: cbxsf_yoast_perma_candidates() (read-only).
+ */
+function cbxsf_yoast_sweep_ok() {
+	return defined( 'WPSEO_VERSION' ) && '' !== (string) get_option( 'permalink_structure' ) && cbxsf_fix_active( 'yoast_perma_sweep' );
+}
+/** Published posts (type post) whose Yoast row still holds '?p=': read-only, newest first. */
+function cbxsf_yoast_perma_candidates( $limit = 200 ) {
+	global $wpdb;
+	$table = $wpdb->prefix . 'yoast_indexable';
+	if ( $table !== $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->esc_like( $table ) ) ) ) {
+		return array();
+	}
+	return array_map(
+		'intval',
+		(array) $wpdb->get_col(
+			$wpdb->prepare(
+				"SELECT i.object_id FROM {$table} i JOIN {$wpdb->posts} p ON p.ID = i.object_id WHERE i.object_type = 'post' AND i.permalink LIKE %s AND p.post_status = 'publish' AND p.post_type = 'post' ORDER BY i.object_id DESC LIMIT %d",
+				'%' . $wpdb->esc_like( '?p=' ) . '%',
+				(int) $limit
+			)
+		)
+	);
+}
+/** Rebuild one post's Yoast row, only when the row holds '?p=' and the post's real permalink does not. True = rebuilt. */
+function cbxsf_yoast_perma_fix( $post_id ) {
+	$post_id = (int) $post_id;
+	$link    = get_permalink( $post_id );
+	if ( ! $post_id || ! $link || false !== strpos( $link, '?p=' ) || ! function_exists( 'YoastSEO' )
+		|| ! class_exists( '\Yoast\WP\SEO\Builders\Indexable_Builder' ) || ! class_exists( '\Yoast\WP\SEO\Repositories\Indexable_Repository' ) ) {
+		return false;
+	}
+	try {
+		$row = YoastSEO()->classes->get( \Yoast\WP\SEO\Repositories\Indexable_Repository::class )->find_by_id_and_type( $post_id, 'post', false );
+		if ( ! $row || false === strpos( (string) $row->permalink, '?p=' ) ) {
+			return false; // healthy, or no row yet (Yoast builds it on the first view)
+		}
+		clean_post_cache( $post_id );
+		YoastSEO()->classes->get( \Yoast\WP\SEO\Builders\Indexable_Builder::class )->build_for_id_and_type( $post_id, 'post', $row );
+	} catch ( \Throwable $e ) {
+		return false;
+	}
+	return true;
+}
+function cbxsf_yoast_perma_mark( $new_status, $old_status, $post ) {
+	if ( 'publish' === $new_status && 'future' === $old_status && is_object( $post ) && ! empty( $post->ID ) ) {
+		$GLOBALS['cbxsf_yoast_published'][ (int) $post->ID ] = true;
+	}
+}
+function cbxsf_yoast_perma_after( $post_id ) {
+	if ( empty( $GLOBALS['cbxsf_yoast_published'][ (int) $post_id ] ) ) {
+		return;
+	}
+	unset( $GLOBALS['cbxsf_yoast_published'][ (int) $post_id ] );
+	if ( cbxsf_yoast_sweep_ok() ) {
+		cbxsf_yoast_perma_fix( $post_id );
+	}
+}
+function cbxsf_yoast_perma_schedule() {
+	if ( cbxsf_yoast_sweep_ok() && ! wp_next_scheduled( 'cbxsf_yoast_perma_sweep' ) ) {
+		wp_schedule_event( time(), 'daily', 'cbxsf_yoast_perma_sweep' );
+	}
+}
+function cbxsf_yoast_perma_sweep() {
+	if ( ! cbxsf_yoast_sweep_ok() ) {
+		wp_clear_scheduled_hook( 'cbxsf_yoast_perma_sweep' ); // key removed, vetoed, Yoast gone or plain permalinks
+		return;
+	}
+	$t0 = microtime( true );
+	foreach ( cbxsf_yoast_perma_candidates( 200 ) as $id ) {
+		if ( microtime( true ) - $t0 > 20 ) {
+			break; // the rest waits for tomorrow's run
+		}
+		if ( cbxsf_yoast_perma_fix( $id ) && function_exists( 'rocket_clean_files' ) ) {
+			rocket_clean_files( array( get_permalink( $id ) ) ); // this URL only; the canonical in its cached copy was '?p='
+		}
+	}
+}
+add_action( 'cbxsf_yoast_perma_sweep', 'cbxsf_yoast_perma_sweep' ); // always: lets a leftover event unschedule itself
+if ( cbxsf_optin( 'yoast_perma_sweep' ) ) {
+	add_action( 'transition_post_status', 'cbxsf_yoast_perma_mark', 99999, 3 );
+	add_action( 'wp_after_insert_post', 'cbxsf_yoast_perma_after', PHP_INT_MAX, 1 );
+	add_action( 'init', 'cbxsf_yoast_perma_schedule', 99 );
+}
+
+/**
+ * FIX #17 (key sitemap_rules) — CPT archive links that 301 stay in the sitemap on slow origins (plan F12 part A).
+ *
+ * FIX #10 (b) decides with one loopback HEAD (5 s) and caches the answer for a day, a FAILED HEAD included (code 0 = keep).
+ * On slow origins the HEAD times out, so 24 archive links that 301 to the homepage stayed in the sitemaps of 16 sites
+ * (brickandrose.com/services/, crystalgrovechiro.com/services/ and /symptoms/ ... 9/29). With the key listed, FIX #10
+ * asks cbxsf_archive_redirects_by_rule() instead (FIX #10's own per-site off switch still comes first):
+ *  (1) The site's redirect rules decide, read on every call (a sitemap build asks once per post type):
+ *      - Redirection (plugin active): an enabled item in an enabled group of the WordPress module, plain URL match, no
+ *        regex, no query in the source, action 'url' with 301/302/303/307/308, whose source equals the archive path under
+ *        that item's own case / trailing-slash flags (the site's Redirection defaults when the item has none);
+ *      - Rank Math (Redirections module on): an active 301/302/307 redirection with an 'exact' source equal to the archive
+ *        path, slashes trimmed (Rank Math's own comparison; its 'ignore case' too).
+ *      A match means the archive redirects: the link is dropped. Only for WordPress at the domain root.
+ *  (2) No matching rule: the HEAD, now with a 10 s timeout. A real answer is cached for a day as before; no answer, 429 or
+ *      5xx is cached as -1 for 10 minutes, then asked again. Same transient names (cbxsf_arch_<md5>): a 1.10.0 value 0 or
+ *      5xx is not trusted (asked again and overwritten); 1.10.0 reads -1 as "keep".
+ * Nothing found either way still means keep: a link is dropped only on evidence of a redirect.
+ */
+function cbxsf_red_matches( $url, $match_data, $defaults, $path ) {
+	if ( ! is_string( $url ) || false !== strpos( $url, '?' ) ) {
+		return false; // a rule with a query string is not a plain path rule
+	}
+	$json  = is_string( $match_data ) ? json_decode( $match_data, true ) : null;
+	$flags = ( is_array( $json ) && isset( $json['source'] ) && is_array( $json['source'] ) ) ? $json['source'] : array();
+	if ( ! empty( $flags['flag_regex'] ) ) {
+		return false;
+	}
+	$flag  = function ( $k ) use ( $flags, $defaults ) {
+		return isset( $flags[ $k ] ) && is_bool( $flags[ $k ] ) ? $flags[ $k ] : ! empty( $defaults[ $k ] );
+	};
+	$a = urldecode( $url );
+	$b = urldecode( $path );
+	if ( $flag( 'flag_trailing' ) ) { // ignore trailing slashes
+		$a = untrailingslashit( $a );
+		$b = untrailingslashit( $b );
+	}
+	if ( $flag( 'flag_case' ) ) { // ignore case
+		$a = strtolower( $a );
+		$b = strtolower( $b );
+	}
+	return $a === $b;
+}
+function cbxsf_rm_redirect_matches( $sources, $path ) {
+	if ( ! is_array( $sources ) ) {
+		return false;
+	}
+	$uri = trim( $path, '/' );
+	foreach ( $sources as $src ) {
+		if ( ! is_array( $src ) || ! isset( $src['pattern'], $src['comparison'] ) || 'exact' !== $src['comparison'] || ! is_string( $src['pattern'] ) ) {
+			continue;
+		}
+		if ( trim( $src['pattern'], '/' ) === $uri || ( isset( $src['ignore'] ) && 'case' === $src['ignore'] && strtolower( $src['pattern'] ) === strtolower( $uri ) ) ) {
+			return true;
+		}
+	}
+	return false;
+}
+/** The redirect rule that sends this post type's archive elsewhere ('redirection #12', 'rank math #4'), or ''. Read-only. */
+function cbxsf_archive_rule( $post_type ) {
+	global $wpdb;
+	$link = get_post_type_archive_link( $post_type );
+	$path = $link ? (string) wp_parse_url( $link, PHP_URL_PATH ) : '';
+	if ( '' === trim( $path, '/' ) || '' !== trim( (string) wp_parse_url( home_url(), PHP_URL_PATH ), '/' ) ) {
+		return ''; // no archive path, or WordPress in a sub-directory
+	}
+	if ( defined( 'REDIRECTION_VERSION' ) ) {
+		$norm = strtolower( untrailingslashit( $path ) );
+		$rows = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT i.id, i.url, i.match_data FROM {$wpdb->prefix}redirection_items i JOIN {$wpdb->prefix}redirection_groups g ON g.id = i.group_id
+				WHERE i.match_url = %s AND i.regex = 0 AND i.status = 'enabled' AND g.status = 'enabled' AND g.module_id = 1
+				AND i.match_type = 'url' AND i.action_type = 'url' AND i.action_code IN (301, 302, 303, 307, 308) ORDER BY i.id",
+				'' === $norm ? '/' : $norm
+			)
+		);
+		$defaults = function_exists( 'red_get_options' ) ? (array) red_get_options() : array();
+		foreach ( (array) $rows as $r ) {
+			if ( cbxsf_red_matches( $r->url, $r->match_data, $defaults, $path ) ) {
+				return 'redirection #' . (int) $r->id;
+			}
+		}
+	}
+	$rm_on = false;
+	if ( class_exists( '\RankMath\Helper' ) ) {
+		try {
+			$rm_on = (bool) \RankMath\Helper::is_module_active( 'redirections' );
+		} catch ( \Throwable $e ) {
+			$rm_on = false;
+		}
+	}
+	if ( $rm_on ) {
+		$rows = $wpdb->get_results(
+			$wpdb->prepare(
+				"SELECT id, sources FROM {$wpdb->prefix}rank_math_redirections WHERE status = 'active' AND header_code IN (301, 302, 307) AND sources LIKE %s ORDER BY id",
+				'%' . $wpdb->esc_like( trim( $path, '/' ) ) . '%'
+			)
+		);
+		foreach ( (array) $rows as $r ) {
+			if ( cbxsf_rm_redirect_matches( maybe_unserialize( $r->sources ), $path ) ) {
+				return 'rank math #' . (int) $r->id;
+			}
+		}
+	}
+	return '';
+}
+/** FIX #10's decision under sitemap_rules: true = the archive redirects (drop it from the sitemap). */
+function cbxsf_archive_redirects_by_rule( $post_type ) {
+	if ( '' !== cbxsf_archive_rule( $post_type ) ) {
+		return true;
+	}
+	$key  = 'cbxsf_arch_' . md5( $post_type );
+	$code = get_transient( $key );
+	$c    = (int) $code;
+	if ( false === $code || ( -1 !== $c && ( $c < 100 || 429 === $c || $c >= 500 ) ) ) { // none, or a 1.10.0 failure
+		$url  = get_post_type_archive_link( $post_type );
+		$resp = $url ? wp_remote_head( $url, array( 'redirection' => 0, 'timeout' => 10, 'sslverify' => false ) ) : null;
+		$c    = ( $resp && ! is_wp_error( $resp ) ) ? (int) wp_remote_retrieve_response_code( $resp ) : 0;
+		$fail = $c < 100 || 429 === $c || $c >= 500;
+		$c    = $fail ? -1 : $c;
+		set_transient( $key, $c, $fail ? 10 * MINUTE_IN_SECONDS : DAY_IN_SECONDS );
+	}
+	return in_array( $c, array( 301, 302, 303, 307, 308 ), true );
+}
+
+/**
+ * FIX #18 (key yoast_agency_author) — "BASIX" named as the author in Yoast's hidden data (plan F16).
+ *
+ * On 35 Yoast sites the agency account (display name 'BASIX', login basixadmin, url thinkbasix.com) authors the blog posts
+ * (31,235 posts 9/29). Yoast prints it as the Article's author Person, as <meta name="author" content="BASIX"> and as the
+ * Slack/Twitter row 'Written by: BASIX' (catalystchiropracticandrehab.com, 920chiro.com ...). All at 99999:
+ *  - wpseo_schema_graph: agency Person nodes (name 'BASIX'; @id / url / sameAs containing basixadmin or thinkbasix; or the
+ *    Yoast person @id of an agency account) are removed. An `author` that pointed only at them is re-pointed at the site's
+ *    own '<home>/#organization' when that node is in the graph, else removed; a co-author list keeps its real authors;
+ *    any other reference to a removed Person is removed. A graph without an agency Person is returned untouched.
+ *  - wpseo_enhanced_slack_data: the row whose value is 'BASIX' (or, on a post by an agency account, its display name).
+ *  - wpseo_meta_author: empty for a post by an agency account or a name 'BASIX' (Yoast then prints no author tag).
+ * Agency accounts: display_name 'BASIX', or user_email / user_url / user_nicename containing thinkbasix or basixadmin (read
+ * once per request, only when one of these filters runs). The visible byline is not touched (question 13).
+ */
+function cbxsf_agency_user_ids() {
+	global $wpdb;
+	static $ids = null;
+	if ( null === $ids ) {
+		$ids = array_map(
+			'intval',
+			(array) $wpdb->get_col(
+				"SELECT ID FROM {$wpdb->users} WHERE display_name = 'BASIX' OR user_email LIKE '%thinkbasix%' OR user_email LIKE '%basixadmin%'
+				OR user_url LIKE '%thinkbasix%' OR user_url LIKE '%basixadmin%' OR user_nicename LIKE '%thinkbasix%' OR user_nicename LIKE '%basixadmin%'"
+			)
+		);
+	}
+	return $ids;
+}
+/** An agency Person object: $person_ids are the Yoast person @ids of the agency accounts. Pure. */
+function cbxsf_is_agency_person( $n, $person_ids = array() ) {
+	if ( ! is_array( $n ) || ! isset( $n['@type'] ) || ! in_array( 'Person', (array) $n['@type'], true ) ) {
+		return false;
+	}
+	if ( isset( $n['@id'] ) && is_string( $n['@id'] ) && in_array( $n['@id'], (array) $person_ids, true ) ) {
+		return true;
+	}
+	if ( isset( $n['name'] ) && is_string( $n['name'] ) && 0 === strcasecmp( trim( $n['name'] ), 'BASIX' ) ) {
+		return true;
+	}
+	$links = array_merge( array( isset( $n['@id'] ) ? $n['@id'] : '', isset( $n['url'] ) ? $n['url'] : '' ), isset( $n['sameAs'] ) ? (array) $n['sameAs'] : array() );
+	foreach ( $links as $l ) {
+		if ( is_string( $l ) && preg_match( '/basixadmin|thinkbasix/i', $l ) ) {
+			return true;
+		}
+	}
+	return false;
+}
+/** Walk a node: references to a removed Person go ($gone = @id => true); `author` falls back to $org (a {"@id"} or null). */
+function cbxsf_agency_refs( $node, $gone, $org, $person_ids = array() ) {
+	$is_gone = function ( $v ) use ( $gone, $person_ids ) {
+		return is_array( $v ) && ( ( ! isset( $v['@type'] ) && isset( $v['@id'] ) && is_string( $v['@id'] ) && isset( $gone[ $v['@id'] ] ) ) || cbxsf_is_agency_person( $v, $person_ids ) );
+	};
+	foreach ( $node as $k => $v ) {
+		if ( ! is_array( $v ) ) {
+			continue;
+		}
+		if ( $is_gone( $v ) ) {
+			if ( 'author' === $k && $org ) {
+				$node[ $k ] = $org;
+			} else {
+				unset( $node[ $k ] );
+			}
+			continue;
+		}
+		if ( $v && cbxsf_rm_is_list( $v ) ) {
+			$kept = array_values( array_filter( $v, function ( $x ) use ( $is_gone ) {
+				return ! $is_gone( $x );
+			} ) );
+			if ( count( $kept ) !== count( $v ) ) {
+				if ( ! $kept ) {
+					if ( 'author' === $k && $org ) {
+						$node[ $k ] = $org;
+					} else {
+						unset( $node[ $k ] );
+					}
+					continue;
+				}
+				$v = $kept;
+			}
+		}
+		$node[ $k ] = cbxsf_agency_refs( $v, $gone, $org, $person_ids );
+	}
+	return $node;
+}
+/** Remove agency Persons from a Yoast @graph list and fix every reference to them. Pure. */
+function cbxsf_agency_graph( $graph, $person_ids, $org_id ) {
+	if ( ! is_array( $graph ) ) {
+		return $graph;
+	}
+	$gone    = array();
+	$removed = false;
+	$list    = cbxsf_rm_is_list( $graph );
+	foreach ( $graph as $k => $node ) {
+		if ( cbxsf_is_agency_person( $node, $person_ids ) ) {
+			if ( isset( $node['@id'] ) && is_string( $node['@id'] ) ) {
+				$gone[ $node['@id'] ] = true;
+			}
+			unset( $graph[ $k ] );
+			$removed = true;
+		}
+	}
+	if ( ! $removed && ! cbxsf_agency_has_nested( $graph, $person_ids ) ) {
+		return $graph; // nothing of the agency's here: untouched
+	}
+	$org = null;
+	foreach ( $graph as $node ) {
+		if ( is_array( $node ) && isset( $node['@id'] ) && $node['@id'] === $org_id ) {
+			$org = array( '@id' => $org_id );
+		}
+	}
+	foreach ( $graph as $k => $node ) {
+		if ( is_array( $node ) ) {
+			$graph[ $k ] = cbxsf_agency_refs( $node, $gone, $org, $person_ids );
+		}
+	}
+	return $list ? array_values( $graph ) : $graph; // a list must stay a JSON array
+}
+function cbxsf_agency_has_nested( $v, $person_ids ) {
+	if ( ! is_array( $v ) ) {
+		return false;
+	}
+	foreach ( $v as $x ) {
+		if ( is_array( $x ) && ( cbxsf_is_agency_person( $x, $person_ids ) || cbxsf_agency_has_nested( $x, $person_ids ) ) ) {
+			return true;
+		}
+	}
+	return false;
+}
+function cbxsf_yoast_agency_schema( $graph, $context = null ) {
+	if ( ! is_array( $graph ) || ! cbxsf_fix_active( 'yoast_agency_author' ) ) {
+		return $graph;
+	}
+	$person_ids = array();
+	if ( is_object( $context ) && function_exists( 'YoastSEO' ) ) {
+		foreach ( cbxsf_agency_user_ids() as $uid ) {
+			try {
+				$pid = YoastSEO()->helpers->schema->id->get_user_schema_id( $uid, $context );
+				if ( is_string( $pid ) && '' !== $pid ) {
+					$person_ids[] = $pid;
+				}
+			} catch ( \Throwable $e ) {
+				continue;
+			}
+		}
+	}
+	return cbxsf_agency_graph( $graph, $person_ids, trailingslashit( home_url() ) . '#organization' );
+}
+/** The author id of the post a Yoast presentation is about, or 0. */
+function cbxsf_yoast_presentation_author( $presentation ) {
+	return ( is_object( $presentation ) && isset( $presentation->context ) && is_object( $presentation->context ) && isset( $presentation->context->post ) && is_object( $presentation->context->post ) && isset( $presentation->context->post->post_author ) )
+		? (int) $presentation->context->post->post_author : 0;
+}
+function cbxsf_yoast_agency_slack( $data, $presentation = null ) {
+	if ( ! is_array( $data ) || ! cbxsf_fix_active( 'yoast_agency_author' ) ) {
+		return $data;
+	}
+	$author = cbxsf_yoast_presentation_author( $presentation );
+	$name   = ( $author && in_array( $author, cbxsf_agency_user_ids(), true ) ) ? trim( (string) get_the_author_meta( 'display_name', $author ) ) : '';
+	foreach ( $data as $label => $value ) {
+		if ( is_string( $value ) && ( 0 === strcasecmp( trim( $value ), 'BASIX' ) || ( '' !== $name && trim( $value ) === $name ) ) ) {
+			unset( $data[ $label ] ); // twitter:label/data 'Written by' => 'BASIX'
+		}
+	}
+	return $data;
+}
+function cbxsf_yoast_agency_meta_author( $name, $presentation = null ) {
+	if ( ! is_string( $name ) || '' === $name || ! cbxsf_fix_active( 'yoast_agency_author' ) ) {
+		return $name;
+	}
+	$author = cbxsf_yoast_presentation_author( $presentation );
+	return ( 0 === strcasecmp( trim( $name ), 'BASIX' ) || ( $author && in_array( $author, cbxsf_agency_user_ids(), true ) ) ) ? '' : $name;
+}
+if ( cbxsf_optin( 'yoast_agency_author' ) ) {
+	add_filter( 'wpseo_schema_graph', 'cbxsf_yoast_agency_schema', 99999, 2 );
+	add_filter( 'wpseo_enhanced_slack_data', 'cbxsf_yoast_agency_slack', 99999, 2 );
+	add_filter( 'wpseo_meta_author', 'cbxsf_yoast_agency_meta_author', 99999, 2 );
+}
+
+/**
+ * FIX #19 (key drdr_author) — "Dr. Dr. Matthew Bynum" on doctors' author pages (plan F17 part B).
+ *
+ * The author-page template (Elementor theme builder, /team/<user>/) puts a fixed "Dr. " before the author's display name in
+ * its H1 and in the "Recent Articles / Recent Videos from ..." headings. A doctor whose display name already starts with
+ * "Dr." gets "Dr. Dr." (10 Rank Math sites, 26 pages 9/29). The template's prefix stays: 16 real doctors' display names
+ * lack "Dr." and would lose it (affilatedchirocenter.com/team/gammon1016att-net/ reads "Dr. Karin Gammon").
+ * On author archives only (is_author()), a repeated "Dr. " (spaces or &nbsp;) becomes one, in each Elementor widget's HTML
+ * (elementor/widget/render_content: where the template prints it), and, in case a site's title template adds it too, in the
+ * Rank Math / Yoast / WordPress titles and the JSON-LD strings. Everything without "Dr. Dr." passes through byte-for-byte.
+ * No output buffer. Filtering the display name itself (the_author) cannot help: the name holds one "Dr." and the template
+ * adds the other.
+ */
+function cbxsf_drdr( $s ) {
+	if ( ! is_string( $s ) || false === strpos( $s, 'Dr.' ) ) {
+		return $s;
+	}
+	$r = preg_replace( '/\bDr\.((?:\s|&nbsp;|&#160;)+)(?:Dr\.(?:\s|&nbsp;|&#160;)+)+/u', 'Dr.$1', $s );
+	return null === $r ? $s : $r; // invalid UTF-8: leave it as it was
+}
+function cbxsf_drdr_deep( $v ) {
+	if ( is_string( $v ) ) {
+		return cbxsf_drdr( $v );
+	}
+	if ( is_array( $v ) ) {
+		foreach ( $v as $k => $x ) {
+			$v[ $k ] = cbxsf_drdr_deep( $x );
+		}
+	}
+	return $v;
+}
+function cbxsf_drdr_author( $v ) {
+	return ( is_author() && cbxsf_fix_active( 'drdr_author' ) ) ? cbxsf_drdr_deep( $v ) : $v;
+}
+if ( cbxsf_optin( 'drdr_author' ) ) {
+	foreach ( array( 'elementor/widget/render_content', 'rank_math/frontend/title', 'rank_math/opengraph/facebook/og_title', 'rank_math/opengraph/twitter/twitter_title',
+		'rank_math/json_ld', 'wpseo_title', 'wpseo_opengraph_title', 'wpseo_twitter_title', 'wpseo_schema_graph', 'document_title_parts' ) as $cbxsf_hook ) {
+		add_filter( $cbxsf_hook, 'cbxsf_drdr_author', 99999 );
+	}
+}
+
+/**
+ * FIX #20 (key paged_front_404) — /page/2/ ... /page/9999/ on the homepage answer 200 with the homepage (plan F24).
+ *
+ * With a static front page WordPress maps /page/N/ onto the front page (WP_Query moves 'paged' into 'page') and renders the
+ * homepage for any N: WP::handle_404() only looks at the request's own 'page' var, which /page/N/ does not set (129 sites
+ * 9/29; the canonical already points home, so low impact). On the static front page, with 'page' (or 'paged') above 1, no
+ * <!--nextpage--> in the page and no paginated Elementor Posts / Loop Grid widget in it ("pagination_type" set in its
+ * _elementor_data), the request becomes a 404 (set_404, status 404, no-cache headers) and the theme's 404 template renders.
+ * It hooks pre_handle_404, core's own 404 decision inside WP::main(), not template_redirect as first planned: the render
+ * harness showed that by template_redirect Rank Math has already built the head for the homepage (its title, canonical to
+ * the homepage, robots index) and the global $post is the homepage, whose H1 then shows inside the 404 template. Here the
+ * query's posts are emptied like a real 404's before WordPress sets up the globals, so every plugin sees a normal 404.
+ * Priority 0: Elementor Pro ranks and caches its theme-builder 'single' templates in its own pre_handle_404 callback (10);
+ * run after it, the 404 page rendered the site's single-post template instead of its 404 template.
+ * For that request only, redirect_canonical is told not to redirect: WP_Query sets page_id to the front page for /page/N/,
+ * and on a 404 core sends any request carrying a page_id to that post's permalink (a 301 to the homepage, seen in the
+ * harness on a Yoast and a Rank Math site). A homepage that lists the blog (show_on_front = posts) and the posts page
+ * (/resources/blog/page/2/) are never touched. Rollout still skips sites whose homepage embeds a paginated widget through a
+ * template (plan F24): this check sees only the page's own data.
+ */
+function cbxsf_paged_front_404( $preempt, $query = null ) {
+	if ( $preempt || ! $query instanceof WP_Query || $query->is_404() || ! $query->is_front_page() || ! $query->is_page() || 'page' !== get_option( 'show_on_front' ) ) {
+		return $preempt;
+	}
+	if ( max( (int) $query->get( 'page' ), (int) $query->get( 'paged' ) ) < 2 || ! cbxsf_fix_active( 'paged_front_404' ) ) {
+		return $preempt;
+	}
+	$post = $query->get_queried_object();
+	if ( ! $post instanceof WP_Post || false !== strpos( (string) $post->post_content, '<!--nextpage-->' )
+		|| preg_match( '/"pagination_type":"(?!")/', (string) get_post_meta( $post->ID, '_elementor_data', true ) ) ) {
+		return $preempt;
+	}
+	$query->set_404();
+	$query->posts      = array(); // a real 404 has no posts: the homepage must not reach the 404 template or the SEO head
+	$query->post_count = 0;
+	$query->post       = null;
+	status_header( 404 );
+	nocache_headers();
+	add_filter( 'redirect_canonical', '__return_false', PHP_INT_MAX ); // this request only (see above)
+	return true; // handled: core's handle_404() would send 200
+}
+if ( cbxsf_optin( 'paged_front_404' ) ) {
+	add_filter( 'pre_handle_404', 'cbxsf_paged_front_404', 0, 2 ); // before Elementor Pro's own pre_handle_404 (10) caches its templates
 }
 /* cbxsf-optin-end ===================================================================================== */
 
